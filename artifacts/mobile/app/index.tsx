@@ -1,0 +1,216 @@
+import * as Location from "expo-location";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Linking,
+  Platform,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { WebView, type WebViewNavigation } from "react-native-webview";
+
+const TARGET_URL = "https://cmds.nl";
+
+type PermissionState = "checking" | "granted" | "denied" | "background-denied";
+
+export default function Index() {
+  const insets = useSafeAreaInsets();
+  const webViewRef = useRef<WebView>(null);
+  const [permissionState, setPermissionState] =
+    useState<PermissionState>("checking");
+  const [webViewLoading, setWebViewLoading] = useState(true);
+  const [canGoBack, setCanGoBack] = useState(false);
+
+  const requestPermissions = useCallback(async () => {
+    setPermissionState("checking");
+
+    try {
+      const foreground = await Location.requestForegroundPermissionsAsync();
+      if (foreground.status !== "granted") {
+        setPermissionState("denied");
+        return;
+      }
+
+      if (Platform.OS !== "web") {
+        const background = await Location.requestBackgroundPermissionsAsync();
+        if (background.status !== "granted") {
+          setPermissionState("background-denied");
+          return;
+        }
+      }
+
+      setPermissionState("granted");
+    } catch {
+      setPermissionState("denied");
+    }
+  }, []);
+
+  useEffect(() => {
+    requestPermissions();
+  }, [requestPermissions]);
+
+  const handleNavigationStateChange = useCallback(
+    (navState: WebViewNavigation) => {
+      setCanGoBack(navState.canGoBack);
+    },
+    [],
+  );
+
+  const openSettings = useCallback(() => {
+    Linking.openSettings().catch(() => undefined);
+  }, []);
+
+  if (permissionState === "checking") {
+    return (
+      <View style={[styles.center, { paddingTop: insets.top }]}>
+        <ActivityIndicator size="large" color="#1e3a8a" />
+        <Text style={styles.loadingText}>Locatietoegang voorbereiden...</Text>
+      </View>
+    );
+  }
+
+  if (permissionState === "denied" || permissionState === "background-denied") {
+    return (
+      <View
+        style={[
+          styles.center,
+          { paddingTop: insets.top + 24, paddingBottom: insets.bottom + 24 },
+        ]}
+      >
+        <Text style={styles.title}>Locatietoegang vereist</Text>
+        <Text style={styles.body}>
+          {permissionState === "background-denied"
+            ? 'Sta locatie "Altijd toestaan" toe zodat de app op de achtergrond GPS kan delen met cmds.nl.'
+            : "Deze app heeft locatietoegang nodig om correct te werken met cmds.nl."}
+        </Text>
+
+        <TouchableOpacity
+          style={styles.primaryButton}
+          onPress={requestPermissions}
+          activeOpacity={0.85}
+        >
+          <Text style={styles.primaryButtonText}>Opnieuw proberen</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.secondaryButton}
+          onPress={openSettings}
+          activeOpacity={0.85}
+        >
+          <Text style={styles.secondaryButtonText}>Open instellingen</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <View style={[styles.container, { paddingTop: insets.top }]}>
+      <WebView
+        ref={webViewRef}
+        source={{ uri: TARGET_URL }}
+        style={styles.webview}
+        originWhitelist={["*"]}
+        javaScriptEnabled
+        domStorageEnabled
+        thirdPartyCookiesEnabled
+        sharedCookiesEnabled
+        geolocationEnabled
+        allowsBackForwardNavigationGestures
+        pullToRefreshEnabled
+        setSupportMultipleWindows={false}
+        mediaPlaybackRequiresUserAction={false}
+        onLoadStart={() => setWebViewLoading(true)}
+        onLoadEnd={() => setWebViewLoading(false)}
+        onNavigationStateChange={handleNavigationStateChange}
+        onShouldStartLoadWithRequest={() => true}
+      />
+
+      {webViewLoading && (
+        <View style={styles.loadingOverlay} pointerEvents="none">
+          <ActivityIndicator size="large" color="#1e3a8a" />
+        </View>
+      )}
+
+      {/* Track canGoBack so future hardware-back handling can use it */}
+      {canGoBack ? null : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: "#0b1d3a",
+  },
+  webview: {
+    flex: 1,
+    backgroundColor: "#ffffff",
+  },
+  loadingOverlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.85)",
+  },
+  center: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 28,
+    backgroundColor: "#0b1d3a",
+  },
+  loadingText: {
+    marginTop: 16,
+    fontSize: 15,
+    color: "#cbd5f5",
+  },
+  title: {
+    fontSize: 22,
+    fontWeight: "700",
+    color: "#ffffff",
+    marginBottom: 12,
+    textAlign: "center",
+  },
+  body: {
+    fontSize: 15,
+    lineHeight: 22,
+    color: "#cbd5f5",
+    textAlign: "center",
+    marginBottom: 28,
+  },
+  primaryButton: {
+    backgroundColor: "#3b82f6",
+    paddingHorizontal: 28,
+    paddingVertical: 14,
+    borderRadius: 12,
+    minWidth: 220,
+    alignItems: "center",
+  },
+  primaryButtonText: {
+    color: "#ffffff",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  secondaryButton: {
+    marginTop: 12,
+    paddingHorizontal: 28,
+    paddingVertical: 12,
+    borderRadius: 12,
+    minWidth: 220,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#334e8a",
+  },
+  secondaryButtonText: {
+    color: "#cbd5f5",
+    fontSize: 15,
+    fontWeight: "500",
+  },
+});

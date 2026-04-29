@@ -1,0 +1,68 @@
+{
+  "expo": {
+    "name": "CMDS",
+    "slug": "mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "cmds",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0b1d3a"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "nl.cmds.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "CMDS gebruikt je locatie om diensten via de website aan te bieden.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmds.nl wanneer je bent ingelogd.",
+        "NSLocationAlwaysUsageDescription": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmds.nl wanneer je bent ingelogd.",
+        "UIBackgroundModes": ["location", "fetch"]
+      }
+    },
+    "android": {
+      "package": "nl.cmds.app",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "INTERNET"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/icon.png",
+        "backgroundColor": "#0b1d3a"
+      }
+    },
+    "web": {
+      "favicon": "./assets/images/icon.png"
+    },
+    "plugins": [
+      [
+        "expo-router",
+        {
+          "origin": "https://replit.com/"
+        }
+      ],
+      "expo-font",
+      "expo-web-browser",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmds.nl wanneer je bent ingelogd.",
+          "locationWhenInUsePermission": "CMDS gebruikt je locatie om diensten via de website aan te bieden.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}
