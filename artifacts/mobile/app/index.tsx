@@ -52,7 +52,7 @@ export default function Index() {
   const webViewRef = useRef<InstanceType<NonNullable<typeof WebView>>>(null);
   const [permissionState, setPermissionState] =
     useState<PermissionState>("checking");
-  const [webViewLoading, setWebViewLoading] = useState(true);
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const [, setCanGoBack] = useState(false);
 
   const requestPermissions = useCallback(async () => {
@@ -196,13 +196,15 @@ export default function Index() {
         injectedJavaScript={INJECTED_BRIDGE}
         injectedJavaScriptBeforeContentLoaded={INJECTED_BRIDGE}
         onMessage={handleWebViewMessage}
-        onLoadStart={() => setWebViewLoading(true)}
-        onLoadEnd={() => setWebViewLoading(false)}
+        onLoadEnd={() => setHasLoadedOnce(true)}
+        onLoadProgress={({ nativeEvent }) => {
+          if (nativeEvent.progress >= 0.7) setHasLoadedOnce(true);
+        }}
         onNavigationStateChange={handleNavigationStateChange}
         onShouldStartLoadWithRequest={() => true}
       />
 
-      {webViewLoading && (
+      {!hasLoadedOnce && (
         <View style={styles.loadingOverlay} pointerEvents="none">
           <ActivityIndicator size="large" color="#3b82f6" />
         </View>
