@@ -10,9 +10,15 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { WebView, type WebViewNavigation } from "react-native-webview";
 
 const TARGET_URL = "https://cmds.nl";
+
+const WebView: typeof import("react-native-webview").WebView | null =
+  Platform.OS === "web"
+    ? null
+    : (require("react-native-webview").WebView as typeof import("react-native-webview").WebView);
+
+type WebViewNavigation = import("react-native-webview").WebViewNavigation;
 
 type PermissionState = "checking" | "granted" | "denied" | "background-denied";
 
@@ -102,6 +108,25 @@ export default function Index() {
         >
           <Text style={styles.secondaryButtonText}>Open instellingen</Text>
         </TouchableOpacity>
+      </View>
+    );
+  }
+
+  if (Platform.OS === "web" || !WebView) {
+    return (
+      <View style={[styles.container, { paddingTop: insets.top }]}>
+        {/* @ts-expect-error iframe is web-only */}
+        <iframe
+          src={TARGET_URL}
+          style={{
+            flex: 1,
+            border: "none",
+            width: "100%",
+            height: "100%",
+            backgroundColor: "#ffffff",
+          }}
+          title="cmds.nl"
+        />
       </View>
     );
   }
