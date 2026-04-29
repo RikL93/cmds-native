@@ -12,11 +12,13 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import {
+  setSupabaseAccessToken,
   startBackgroundLocation,
   stopBackgroundLocation,
 } from "@/lib/backgroundLocation";
 
 const TARGET_URL = "https://cmdsevent.nl";
+const SUPABASE_PROJECT_REF = "txauyjkivyzgxetmadkj";
 
 const WebView: typeof import("react-native-webview").WebView | null =
   Platform.OS === "web"
@@ -31,17 +33,48 @@ type PermissionState = "checking" | "granted" | "denied" | "background-denied";
 
 const INJECTED_BRIDGE = `
 (function() {
-  if (window.CMDS_NATIVE) return;
+  if (window.CMDS_NATIVE) return true;
+  var SUPABASE_TOKEN_KEY = 'sb-${SUPABASE_PROJECT_REF}-auth-token';
+  var lastToken = null;
+
   function send(msg) {
     try {
       window.ReactNativeWebView.postMessage(JSON.stringify(msg));
     } catch (e) {}
   }
+
+  function readSupabaseToken() {
+    try {
+      var raw = window.localStorage.getItem(SUPABASE_TOKEN_KEY);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      if (parsed && parsed.access_token) return parsed.access_token;
+      if (Array.isArray(parsed) && parsed[0]) return parsed[0];
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function syncToken() {
+    var token = readSupabaseToken();
+    if (token !== lastToken) {
+      lastToken = token;
+      send({ type: 'supabase_token', token: token });
+    }
+  }
+
   window.CMDS_NATIVE = {
     startBackgroundGPS: function() { send({ type: 'start_gps' }); },
     stopBackgroundGPS: function() { send({ type: 'stop_gps' }); },
+    syncSupabaseToken: syncToken,
     isNativeApp: true,
   };
+
+  syncToken();
+  setInterval(syncToken, 5000);
+  window.addEventListener('storage', syncToken);
+
   send({ type: 'ready', url: window.location.href });
   true;
 })();
@@ -105,6 +138,12 @@ export default function Index() {
         startBackgroundLocation().catch(() => undefined);
       } else if (message.type === "stop_gps") {
         stopBackgroundLocation().catch(() => undefined);
+      } else if (message.type === "supabase_token") {
+        const token =
+          typeof message.token === "string" && message.token.length > 0
+            ? message.token
+            : null;
+        setSupabaseAccessToken(token).catch(() => undefined);
       }
     } catch {
       // Ignore malformed messages.
@@ -161,7 +200,7 @@ export default function Index() {
   if (Platform.OS === "web" || !WebView) {
     return (
       <View style={[styles.container, { paddingTop: insets.top }]}>
-        {/* @ts-expect-error iframe is web-only */}
+        {/* @ts-ignore iframe is web-only */}
         <iframe
           src={TARGET_URL}
           style={{

@@ -1,14 +1,32 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Location from "expo-location";
 import * as TaskManager from "expo-task-manager";
 import { Platform } from "react-native";
 
 export const LOCATION_TASK_NAME = "cmds-background-location-task";
-export const LOCATION_ENDPOINT = "https://cmdsevent.nl/api/location";
+export const LOCATION_ENDPOINT =
+  "https://txauyjkivyzgxetmadkj.supabase.co/functions/v1/ingest-location";
+
+export const SUPABASE_TOKEN_STORAGE_KEY = "cmds.supabase.access_token";
 
 type BackgroundTaskBody = {
   data?: { locations?: Location.LocationObject[] };
   error?: TaskManager.TaskManagerError | null;
 };
+
+export async function setSupabaseAccessToken(
+  token: string | null,
+): Promise<void> {
+  if (token && token.length > 0) {
+    await AsyncStorage.setItem(SUPABASE_TOKEN_STORAGE_KEY, token);
+  } else {
+    await AsyncStorage.removeItem(SUPABASE_TOKEN_STORAGE_KEY);
+  }
+}
+
+export async function getSupabaseAccessToken(): Promise<string | null> {
+  return AsyncStorage.getItem(SUPABASE_TOKEN_STORAGE_KEY);
+}
 
 if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
   TaskManager.defineTask(LOCATION_TASK_NAME, async (body) => {
@@ -23,6 +41,11 @@ if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
       return;
     }
 
+    const accessToken = await getSupabaseAccessToken();
+    if (!accessToken) {
+      return;
+    }
+
     for (const location of locations) {
       const payload = {
         latitude: location.coords.latitude,
@@ -33,14 +56,17 @@ if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
         speed: location.coords.speed,
         heading: location.coords.heading,
         timestamp: location.timestamp,
+        recorded_at: new Date(location.timestamp).toISOString(),
         source: "cmds-mobile-app",
       };
 
       try {
         await fetch(LOCATION_ENDPOINT, {
           method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+          },
           body: JSON.stringify(payload),
         });
       } catch {
@@ -68,7 +94,8 @@ export async function startBackgroundLocation(): Promise<void> {
     pausesUpdatesAutomatically: false,
     foregroundService: {
       notificationTitle: "CMDS deelt je locatie",
-      notificationBody: "GPS wordt op de achtergrond gedeeld met cmds.nl.",
+      notificationBody:
+        "GPS wordt op de achtergrond gedeeld met cmdsevent.nl.",
       notificationColor: "#0b1d3a",
     },
   });
