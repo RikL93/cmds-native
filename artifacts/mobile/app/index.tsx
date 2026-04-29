@@ -75,6 +75,14 @@ const INJECTED_BRIDGE = `
   setInterval(syncToken, 5000);
   window.addEventListener('storage', syncToken);
 
+  window.CMDS_NATIVE._receiveLocation = function(coords) {
+    try {
+      var evt = new CustomEvent('cmds-native-location', { detail: coords });
+      window.dispatchEvent(evt);
+    } catch (e) {}
+    window.CMDS_NATIVE.lastLocation = coords;
+  };
+
   send({ type: 'ready', url: window.location.href });
   true;
 })();
@@ -120,6 +128,54 @@ export default function Index() {
   useEffect(() => {
     if (permissionState !== "granted") return;
     startBackgroundLocation().catch(() => undefined);
+  }, [permissionState]);
+
+  // Foreground GPS watcher: continuously push fresh coordinates into the
+  // WebView so the website always has up-to-date location data while open.
+  useEffect(() => {
+    if (permissionState !== "granted" || Platform.OS === "web") return;
+
+    let cancelled = false;
+    let subscription: Location.LocationSubscription | null = null;
+
+    (async () => {
+      try {
+        subscription = await Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.High,
+            timeInterval: 5_000,
+            distanceInterval: 0,
+          },
+          (location) => {
+            if (cancelled) return;
+            const coords = {
+              latitude: location.coords.latitude,
+              longitude: location.coords.longitude,
+              accuracy: location.coords.accuracy,
+              altitude: location.coords.altitude,
+              altitudeAccuracy: location.coords.altitudeAccuracy,
+              speed: location.coords.speed,
+              heading: location.coords.heading,
+              timestamp: location.timestamp,
+            };
+            const js = `
+              if (window.CMDS_NATIVE && window.CMDS_NATIVE._receiveLocation) {
+                window.CMDS_NATIVE._receiveLocation(${JSON.stringify(coords)});
+              }
+              true;
+            `;
+            webViewRef.current?.injectJavaScript(js);
+          },
+        );
+      } catch {
+        // Ignore — the background task will still keep posting updates.
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      subscription?.remove();
+    };
   }, [permissionState]);
 
   const handleNavigationStateChange = useCallback(
