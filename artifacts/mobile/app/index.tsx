@@ -16,7 +16,7 @@ import {
   stopBackgroundLocation,
 } from "@/lib/backgroundLocation";
 
-const TARGET_URL = "http://cmds.nl";
+const TARGET_URL = "https://cmdsevent.nl";
 
 const WebView: typeof import("react-native-webview").WebView | null =
   Platform.OS === "web"
@@ -195,7 +195,6 @@ export default function Index() {
         mediaPlaybackRequiresUserAction={false}
         injectedJavaScript={INJECTED_BRIDGE}
         injectedJavaScriptBeforeContentLoaded={INJECTED_BRIDGE}
-        mixedContentMode="always"
         onMessage={handleWebViewMessage}
         onLoadStart={() => setWebViewLoading(true)}
         onLoadEnd={() => setWebViewLoading(false)}

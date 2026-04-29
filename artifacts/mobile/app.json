@@ -18,8 +18,8 @@
       "bundleIdentifier": "nl.cmds.app",
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "CMDS gebruikt je locatie om diensten via de website aan te bieden.",
-        "NSLocationAlwaysAndWhenInUseUsageDescription": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmds.nl wanneer je bent ingelogd.",
-        "NSLocationAlwaysUsageDescription": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmds.nl wanneer je bent ingelogd.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmdsevent.nl wanneer je bent ingelogd.",
+        "NSLocationAlwaysUsageDescription": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmdsevent.nl wanneer je bent ingelogd.",
         "UIBackgroundModes": ["location", "fetch"]
       }
     },
@@ -53,18 +53,10 @@
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmds.nl wanneer je bent ingelogd.",
+          "locationAlwaysAndWhenInUsePermission": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmdsevent.nl wanneer je bent ingelogd.",
           "locationWhenInUsePermission": "CMDS gebruikt je locatie om diensten via de website aan te bieden.",
           "isAndroidBackgroundLocationEnabled": true,
           "isAndroidForegroundServiceEnabled": true
-        }
-      ],
-      [
-        "expo-build-properties",
-        {
-          "android": {
-            "usesCleartextTraffic": true
-          }
         }
       ]
     ],

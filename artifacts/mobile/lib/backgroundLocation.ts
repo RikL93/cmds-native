@@ -3,7 +3,7 @@ import * as TaskManager from "expo-task-manager";
 import { Platform } from "react-native";
 
 export const LOCATION_TASK_NAME = "cmds-background-location-task";
-export const LOCATION_ENDPOINT = "http://cmds.nl/api/location";
+export const LOCATION_ENDPOINT = "https://cmdsevent.nl/api/location";
 
 type BackgroundTaskBody = {
   data?: { locations?: Location.LocationObject[] };
