@@ -11,24 +11,49 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import {
+  startBackgroundLocation,
+  stopBackgroundLocation,
+} from "@/lib/backgroundLocation";
+
 const TARGET_URL = "https://cmds.nl";
 
 const WebView: typeof import("react-native-webview").WebView | null =
   Platform.OS === "web"
     ? null
-    : (require("react-native-webview").WebView as typeof import("react-native-webview").WebView);
+    : (require("react-native-webview")
+        .WebView as typeof import("react-native-webview").WebView);
 
 type WebViewNavigation = import("react-native-webview").WebViewNavigation;
+type WebViewMessageEvent = import("react-native-webview").WebViewMessageEvent;
 
 type PermissionState = "checking" | "granted" | "denied" | "background-denied";
 
+const INJECTED_BRIDGE = `
+(function() {
+  if (window.CMDS_NATIVE) return;
+  function send(msg) {
+    try {
+      window.ReactNativeWebView.postMessage(JSON.stringify(msg));
+    } catch (e) {}
+  }
+  window.CMDS_NATIVE = {
+    startBackgroundGPS: function() { send({ type: 'start_gps' }); },
+    stopBackgroundGPS: function() { send({ type: 'stop_gps' }); },
+    isNativeApp: true,
+  };
+  send({ type: 'ready', url: window.location.href });
+  true;
+})();
+`;
+
 export default function Index() {
   const insets = useSafeAreaInsets();
-  const webViewRef = useRef<WebView>(null);
+  const webViewRef = useRef<InstanceType<NonNullable<typeof WebView>>>(null);
   const [permissionState, setPermissionState] =
     useState<PermissionState>("checking");
   const [webViewLoading, setWebViewLoading] = useState(true);
-  const [canGoBack, setCanGoBack] = useState(false);
+  const [, setCanGoBack] = useState(false);
 
   const requestPermissions = useCallback(async () => {
     setPermissionState("checking");
@@ -58,12 +83,33 @@ export default function Index() {
     requestPermissions();
   }, [requestPermissions]);
 
+  // Start background GPS as soon as permissions are granted.
+  useEffect(() => {
+    if (permissionState !== "granted") return;
+    startBackgroundLocation().catch(() => undefined);
+  }, [permissionState]);
+
   const handleNavigationStateChange = useCallback(
     (navState: WebViewNavigation) => {
       setCanGoBack(navState.canGoBack);
     },
     [],
   );
+
+  const handleWebViewMessage = useCallback((event: WebViewMessageEvent) => {
+    try {
+      const message = JSON.parse(event.nativeEvent.data);
+      if (!message || typeof message !== "object") return;
+
+      if (message.type === "start_gps") {
+        startBackgroundLocation().catch(() => undefined);
+      } else if (message.type === "stop_gps") {
+        stopBackgroundLocation().catch(() => undefined);
+      }
+    } catch {
+      // Ignore malformed messages.
+    }
+  }, []);
 
   const openSettings = useCallback(() => {
     Linking.openSettings().catch(() => undefined);
@@ -72,7 +118,7 @@ export default function Index() {
   if (permissionState === "checking") {
     return (
       <View style={[styles.center, { paddingTop: insets.top }]}>
-        <ActivityIndicator size="large" color="#1e3a8a" />
+        <ActivityIndicator size="large" color="#3b82f6" />
         <Text style={styles.loadingText}>Locatietoegang voorbereiden...</Text>
       </View>
     );
@@ -147,6 +193,9 @@ export default function Index() {
         pullToRefreshEnabled
         setSupportMultipleWindows={false}
         mediaPlaybackRequiresUserAction={false}
+        injectedJavaScript={INJECTED_BRIDGE}
+        injectedJavaScriptBeforeContentLoaded={INJECTED_BRIDGE}
+        onMessage={handleWebViewMessage}
         onLoadStart={() => setWebViewLoading(true)}
         onLoadEnd={() => setWebViewLoading(false)}
         onNavigationStateChange={handleNavigationStateChange}
@@ -155,12 +204,9 @@ export default function Index() {
 
       {webViewLoading && (
         <View style={styles.loadingOverlay} pointerEvents="none">
-          <ActivityIndicator size="large" color="#1e3a8a" />
+          <ActivityIndicator size="large" color="#3b82f6" />
         </View>
       )}
-
-      {/* Track canGoBack so future hardware-back handling can use it */}
-      {canGoBack ? null : null}
     </View>
   );
 }
