@@ -87,9 +87,9 @@ export async function startBackgroundLocation(): Promise<void> {
 
   await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
     accuracy: Location.Accuracy.Balanced,
-    timeInterval: 15_000,
+    timeInterval: 30_000,
     distanceInterval: 0,
-    deferredUpdatesInterval: 15_000,
+    deferredUpdatesInterval: 30_000,
     showsBackgroundLocationIndicator: true,
     pausesUpdatesAutomatically: false,
     foregroundService: {
