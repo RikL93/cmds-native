@@ -31,6 +31,8 @@ type WebViewMessageEvent = import("react-native-webview").WebViewMessageEvent;
 
 type PermissionState = "checking" | "granted" | "denied" | "background-denied";
 
+const NATIVE_PLATFORM = Platform.OS === "ios" ? "ios" : "android";
+
 const INJECTED_BRIDGE = `
 (function() {
   if (window.CMDS_NATIVE) return true;
@@ -65,10 +67,12 @@ const INJECTED_BRIDGE = `
   }
 
   window.CMDS_NATIVE = {
+    isNativeApp: true,
+    platform: '${NATIVE_PLATFORM}',
     startBackgroundGPS: function() { send({ type: 'start_gps' }); },
     stopBackgroundGPS: function() { send({ type: 'stop_gps' }); },
     syncSupabaseToken: syncToken,
-    isNativeApp: true,
+    lastLocation: undefined,
   };
 
   syncToken();
