@@ -1,7 +1,9 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Location from "expo-location";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   AppState,
   type AppStateStatus,
   Linking,
@@ -16,6 +18,10 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import {
+  openAppDetailsSettings,
+  requestIgnoreBatteryOptimizations,
+} from "@/lib/batteryOptimization";
+import {
   clearDiagnostics,
   diagnosticsPatchFromLinkedStatus,
   getDiagnostics,
@@ -28,6 +34,8 @@ import {
   type Diagnostics,
 } from "@/lib/backgroundLocation";
 import { fetchLinkedUnitStatus } from "@/lib/linkedUnit";
+
+const BATTERY_PROMPT_FLAG_KEY = "cmds.askedBatteryOptimization";
 
 const TARGET_URL = "https://cmdsevent.nl";
 const SUPABASE_PROJECT_REF = "txauyjkivyzgxetmadkj";
@@ -251,6 +259,44 @@ export default function Index() {
     startBackgroundLocation().catch(() => undefined);
   }, [permissionState]);
 
+  // After permissions are granted, ask the user (once) to disable battery
+  // optimisation so OEM battery killers (Xiaomi/Samsung/Huawei) don't shut
+  // down the foreground service.
+  useEffect(() => {
+    if (permissionState !== "granted" || Platform.OS !== "android") return;
+    let cancelled = false;
+    (async () => {
+      const asked = await AsyncStorage.getItem(BATTERY_PROMPT_FLAG_KEY);
+      if (asked === "1" || cancelled) return;
+      Alert.alert(
+        "Houd CMDS draaien",
+        "Voor betrouwbare GPS-deling moet CMDS uitgesloten worden van batterij­optimalisatie. Tik 'Toestaan' in het volgende scherm.",
+        [
+          {
+            text: "Later",
+            style: "cancel",
+            onPress: () => {
+              AsyncStorage.setItem(BATTERY_PROMPT_FLAG_KEY, "1").catch(
+                () => undefined,
+              );
+            },
+          },
+          {
+            text: "Instellen",
+            onPress: async () => {
+              await requestIgnoreBatteryOptimizations();
+              await AsyncStorage.setItem(BATTERY_PROMPT_FLAG_KEY, "1");
+            },
+          },
+        ],
+        { cancelable: false },
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [permissionState]);
+
   // Foreground GPS watcher: continuously push fresh coordinates into the
   // WebView so the website always has up-to-date location data while open.
   useEffect(() => {
@@ -370,6 +416,28 @@ export default function Index() {
     setTestResult(null);
     await refreshDiagnostics();
   }, [refreshDiagnostics]);
+
+  const handleRequestBatteryOptimization = useCallback(async () => {
+    await requestIgnoreBatteryOptimizations();
+    await AsyncStorage.setItem(BATTERY_PROMPT_FLAG_KEY, "1");
+  }, []);
+
+  const handleOpenAppSettings = useCallback(async () => {
+    await openAppDetailsSettings();
+  }, []);
+
+  const showPinInstructions = useCallback(() => {
+    Alert.alert(
+      "CMDS vastpinnen",
+      "Zo blijft CMDS draaien wanneer je 'alle apps sluiten' veegt:\n\n" +
+        "1. Open je multitasking-overzicht (de knop met de drie streepjes / vierkant, of veeg vanaf onder en houd vast).\n" +
+        "2. Tik op het CMDS-icoon bovenaan de kaart.\n" +
+        "3. Kies 'Vastzetten' of 'Pin'.\n\n" +
+        "Mocht je deze optie niet zien, sta hem dan eerst aan in:\n" +
+        "Instellingen → Beveiliging → App vastzetten.",
+      [{ text: "Begrepen" }],
+    );
+  }, []);
 
   if (permissionState === "checking") {
     return (
@@ -621,6 +689,52 @@ export default function Index() {
               </TouchableOpacity>
             </View>
 
+            {Platform.OS === "android" && (
+              <View style={styles.section}>
+                <Text style={styles.sectionTitle}>App actief houden</Text>
+                <Text style={styles.sectionBody}>
+                  Android sluit de app standaard na een tijdje om batterij te
+                  besparen. Schakel onderstaande opties in zodat CMDS blijft
+                  draaien zolang jij hem niet zelf afsluit.
+                </Text>
+
+                <TouchableOpacity
+                  style={styles.primaryButton}
+                  onPress={handleRequestBatteryOptimization}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.primaryButtonText}>
+                    Negeer batterij­optimalisatie
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.secondaryButton}
+                  onPress={handleOpenAppSettings}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.secondaryButtonText}>
+                    Open app-instellingen
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.secondaryButton}
+                  onPress={showPinInstructions}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.secondaryButtonText}>
+                    Hoe pin ik de app vast?
+                  </Text>
+                </TouchableOpacity>
+
+                <Text style={styles.sectionHint}>
+                  Tip: gebruik "App vastpinnen" als je voorkomt dat per ongeluk
+                  swipen op "alle apps sluiten" CMDS afsluit.
+                </Text>
+              </View>
+            )}
+
             {testResult != null && (
               <View style={styles.testResultBox}>
                 <Text style={styles.testResultText}>{testResult}</Text>
@@ -806,6 +920,34 @@ const styles = StyleSheet.create({
   modalActions: {
     marginTop: 24,
     alignItems: "center",
+  },
+  section: {
+    marginTop: 32,
+    paddingTop: 20,
+    borderTopWidth: 1,
+    borderTopColor: "#1e3a6e",
+    alignItems: "center",
+  },
+  sectionTitle: {
+    color: "#ffffff",
+    fontSize: 17,
+    fontWeight: "700",
+    marginBottom: 8,
+  },
+  sectionBody: {
+    color: "#cbd5f5",
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: "center",
+    marginBottom: 16,
+  },
+  sectionHint: {
+    marginTop: 14,
+    color: "#94a3b8",
+    fontSize: 12,
+    fontStyle: "italic",
+    textAlign: "center",
+    lineHeight: 18,
   },
   testResultBox: {
     marginTop: 20,
