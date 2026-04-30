@@ -1,0 +1,64 @@
+Onze Supabase edge function ingest-location ontvangt nu nul POSTs vanuit de native app, terwijl whoami-unit wel correct wordt aangeroepen. Background-GPS naar Supabase werkt dus niet. Implementeer/fix het volgende exact zoals beschreven.
+
+Endpoints
+Base URL: https://txauyjkivyzgxetmadkj.supabase.co/functions/v1
+
+GET /whoami-unit — checkt of de ingelogde gebruiker een gekoppelde eenheid heeft.
+POST /ingest-location — ontvangt GPS-coördinaten en koppelt ze aan de eenheid.
+Beide endpoints vereisen header:
+
+Authorization: Bearer <Supabase access_token>
+Het access_token staat in localStorage onder de key sb-txauyjkivyzgxetmadkj-auth-token (JSON, veld access_token). Refresh het token via de Supabase JS client als het verlopen is — POSTs met een verlopen token geven 401.
+
+Vereiste flow
+[app start / login]
+   ↓
+GET /whoami-unit  ────────►  { linked: true, unit: {...} }  →  start GPS-loop
+                  ────────►  { linked: false }              →  poll opnieuw na 30s
+[GPS-loop, ook in background]
+   elke 10–15s:
+   POST /ingest-location  body: { latitude, longitude, accuracy, timestamp, source: "expo-bg" }
+BELANGRIJK: blijf POSTen zolang whoami-unit ooit linked: true heeft geretourneerd. Niet alleen wanneer de app op de voorgrond staat.
+
+Exacte POST body voor /ingest-location
+
+{
+  "latitude": 52.7107676,
+  "longitude": 5.7411607,
+  "accuracy": 5.0,
+  "altitude": null,
+  "altitude_accuracy": null,
+  "speed": null,
+  "heading": null,
+  "recorded_at": "2026-04-30T18:00:00.000Z",
+  "source": "expo-bg"
+}
+Ook geaccepteerd (legacy): lat/lng in plaats van latitude/longitude, en timestamp (ms epoch) in plaats van recorded_at (ISO-string).
+
+Vereist: latitude (-90..90), longitude (-180..180). Alle andere velden optioneel.
+
+Verwachte responses
+200 { "ok": true, "unit_id": "..." } → succes, opgeslagen.
+200 { "ok": true, "skipped": true, "reason": "no_linked_unit" } → JWT is geldig maar deze gebruiker heeft geen gekoppelde eenheid. Stop de GPS-loop, ping /whoami-unit opnieuw na 30s.
+401 { "error": "Unauthorized" } → token verlopen of ontbreekt. Refresh token en retry.
+400 { "error": "Invalid body", ... } → payload klopt niet. Log volledige response en fix.
+Frequentie & background
+Foreground: POST elke 10 seconden.
+Background (scherm uit, app niet in focus): POST minimaal elke 30 seconden via expo-task-manager + expo-location met Location.startLocationUpdatesAsync en accuracy: Location.Accuracy.High.
+Android: vraag ACCESS_BACKGROUND_LOCATION permission.
+iOS: zet NSLocationAlwaysAndWhenInUseUsageDescription + UIBackgroundModes: ["location"] in app.json.
+Debug-vereisten (cruciaal)
+Log voor élke POST:
+
+[CMDS-GPS] POST /ingest-location → status=<n>, body=<json>, took=<ms>ms
+Log élke whoami-unit response volledig. Stuur die logs naar console én naar een in-app debug-scherm zodat we ze in Lovable kunnen vergelijken met de edge function logs.
+
+Testcommando dat MOET slagen
+
+curl -X POST 'https://txauyjkivyzgxetmadkj.supabase.co/functions/v1/ingest-location' \
+  -H 'Authorization: Bearer <jouw_access_token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"latitude":52.7107,"longitude":5.7411,"accuracy":5,"source":"manual-test"}'
+Verwacht: 200 met ok: true (en unit_id als de user gekoppeld is, anders skipped: true, reason: "no_linked_unit").
+
+Als deze curl met jullie native-shell-token een ander resultaat geeft → dáár zit het probleem (verkeerde user ingelogd, of token niet meer geldig).

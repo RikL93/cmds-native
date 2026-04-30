@@ -16,7 +16,8 @@ export const LOCATION_ENDPOINT =
 export const SUPABASE_TOKEN_STORAGE_KEY = "cmds.supabase.access_token";
 export const DIAGNOSTICS_STORAGE_KEY = "cmds.diagnostics";
 
-const BACKGROUND_LINKED_CHECK_TTL_MS = 60_000;
+const BACKGROUND_LINKED_CHECK_TTL_MS = 30_000;
+const FOREGROUND_LINKED_CHECK_TTL_MS = 15_000;
 
 type BackgroundTaskBody = {
   data?: { locations?: Location.LocationObject[] };
@@ -31,6 +32,7 @@ export type Diagnostics = {
   lastPostStatus: number | null;
   lastPostError: string | null;
   lastPostBody: string | null;
+  lastPostSource: string | null;
   postSuccessCount: number;
   postFailureCount: number;
   postSkippedCount: number;
@@ -51,6 +53,7 @@ const DEFAULT_DIAGNOSTICS: Diagnostics = {
   lastPostStatus: null,
   lastPostError: null,
   lastPostBody: null,
+  lastPostSource: null,
   postSuccessCount: 0,
   postFailureCount: 0,
   postSkippedCount: 0,
@@ -128,10 +131,33 @@ export async function getSupabaseAccessToken(): Promise<string | null> {
   return AsyncStorage.getItem(SUPABASE_TOKEN_STORAGE_KEY);
 }
 
+/**
+ * Build the exact JSON body that the ingest-location edge function expects.
+ * Snake_case as documented by the Lovable backend.
+ */
+function buildPayload(
+  location: Location.LocationObject,
+  source: string,
+): Record<string, unknown> {
+  return {
+    latitude: location.coords.latitude,
+    longitude: location.coords.longitude,
+    accuracy: location.coords.accuracy,
+    altitude: location.coords.altitude,
+    altitude_accuracy: location.coords.altitudeAccuracy,
+    speed: location.coords.speed,
+    heading: location.coords.heading,
+    recorded_at: new Date(location.timestamp).toISOString(),
+    source,
+  };
+}
+
 async function postLocation(
   payload: Record<string, unknown>,
   accessToken: string,
+  source: string,
 ): Promise<void> {
+  const startedAt = Date.now();
   try {
     const response = await fetch(LOCATION_ENDPOINT, {
       method: "POST",
@@ -147,6 +173,10 @@ async function postLocation(
     } catch {
       bodyText = "";
     }
+    const took = Date.now() - startedAt;
+    console.log(
+      `[CMDS-GPS] POST /ingest-location → status=${response.status}, body=${bodyText.slice(0, 200)}, took=${took}ms (source=${source})`,
+    );
     const current = await getDiagnostics();
     if (response.ok) {
       await patchDiagnostics({
@@ -154,6 +184,7 @@ async function postLocation(
         lastPostStatus: response.status,
         lastPostError: null,
         lastPostBody: bodyText.slice(0, 500),
+        lastPostSource: source,
         postSuccessCount: current.postSuccessCount + 1,
       });
     } else {
@@ -162,27 +193,73 @@ async function postLocation(
         lastPostStatus: response.status,
         lastPostError: `HTTP ${response.status}`,
         lastPostBody: bodyText.slice(0, 500),
+        lastPostSource: source,
         postFailureCount: current.postFailureCount + 1,
       });
     }
   } catch (e) {
+    const took = Date.now() - startedAt;
+    const errMsg = e instanceof Error ? e.message : String(e);
+    console.log(
+      `[CMDS-GPS] POST /ingest-location → ERROR ${errMsg}, took=${took}ms (source=${source})`,
+    );
     const current = await getDiagnostics();
     await patchDiagnostics({
       lastPostAt: new Date().toISOString(),
       lastPostStatus: null,
-      lastPostError: e instanceof Error ? e.message : String(e),
+      lastPostError: errMsg,
       lastPostBody: null,
+      lastPostSource: source,
       postFailureCount: current.postFailureCount + 1,
     });
   }
 }
 
-async function recordSkip(reason: string): Promise<void> {
+async function recordSkip(reason: string, source: string): Promise<void> {
   const current = await getDiagnostics();
+  console.log(`[CMDS-GPS] SKIP /ingest-location → ${reason} (source=${source})`);
   await patchDiagnostics({
     postSkippedCount: current.postSkippedCount + 1,
     lastSkipReason: reason,
+    lastPostSource: source,
   });
+}
+
+/**
+ * Posts a single location fix via /ingest-location, but only after passing
+ * the linked-unit gate. Used by both the background TaskManager and the
+ * foreground 10s loop.
+ */
+export async function postLocationIfLinked(
+  location: Location.LocationObject,
+  source: string,
+  linkedTtlMs: number,
+): Promise<void> {
+  const accessToken = await getSupabaseAccessToken();
+  if (!accessToken) {
+    await recordSkip("geen token — log in op de website", source);
+    return;
+  }
+
+  const linkedStatus = await getOrRefreshLinkedUnitStatus(
+    accessToken,
+    linkedTtlMs,
+  );
+  await patchDiagnostics(diagnosticsPatchFromLinkedStatus(linkedStatus));
+
+  if (linkedStatus.tokenInvalid) {
+    await recordSkip("token verlopen — sync token via website", source);
+    return;
+  }
+  if (!linkedStatus.linked) {
+    await recordSkip(
+      "geen gekoppelde eenheid — kies een call sign in CMDS",
+      source,
+    );
+    return;
+  }
+
+  await postLocation(buildPayload(location, source), accessToken, source);
 }
 
 if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
@@ -190,6 +267,7 @@ if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
     const { data, error } = body as BackgroundTaskBody;
 
     if (error) {
+      console.log(`[CMDS-GPS] background task error: ${error.message}`);
       await patchDiagnostics({
         lastPostError: `task error: ${error.message ?? "unknown"}`,
       });
@@ -210,44 +288,12 @@ if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
       });
     }
 
-    const accessToken = await getSupabaseAccessToken();
-    if (!accessToken) {
-      await recordSkip("geen token — log in op de website");
-      return;
-    }
-
-    // Sanity check: only POST when an active unit is linked in CMDS.
-    const linkedStatus = await getOrRefreshLinkedUnitStatus(
-      accessToken,
-      BACKGROUND_LINKED_CHECK_TTL_MS,
-    );
-    await patchDiagnostics(diagnosticsPatchFromLinkedStatus(linkedStatus));
-
-    if (linkedStatus.tokenInvalid) {
-      await recordSkip("token verlopen — sync token via website");
-      return;
-    }
-    if (!linkedStatus.linked) {
-      await recordSkip(
-        "geen gekoppelde eenheid — kies een call sign in CMDS",
-      );
-      return;
-    }
-
     for (const location of locations) {
-      const payload = {
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-        accuracy: location.coords.accuracy,
-        altitude: location.coords.altitude,
-        altitudeAccuracy: location.coords.altitudeAccuracy,
-        speed: location.coords.speed,
-        heading: location.coords.heading,
-        timestamp: location.timestamp,
-        recorded_at: new Date(location.timestamp).toISOString(),
-        source: "cmds-mobile-app",
-      };
-      await postLocation(payload, accessToken);
+      await postLocationIfLinked(
+        location,
+        "expo-bg",
+        BACKGROUND_LINKED_CHECK_TTL_MS,
+      );
     }
   });
 }
@@ -262,7 +308,7 @@ export async function startBackgroundLocation(): Promise<void> {
   }
 
   await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
-    accuracy: Location.Accuracy.Balanced,
+    accuracy: Location.Accuracy.High,
     timeInterval: 30_000,
     distanceInterval: 0,
     deferredUpdatesInterval: 30_000,
@@ -290,6 +336,29 @@ export async function stopBackgroundLocation(): Promise<void> {
 export async function isBackgroundLocationActive(): Promise<boolean> {
   if (Platform.OS === "web") return false;
   return Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
+}
+
+/**
+ * Posts the current foreground location via /ingest-location with
+ * source="expo-fg". Called from the foreground 10s loop in the UI.
+ * TTL is short so a freshly-linked unit becomes visible immediately.
+ */
+export async function postForegroundLocation(): Promise<void> {
+  if (Platform.OS === "web") return;
+  let coords: Location.LocationObject;
+  try {
+    coords = await Location.getCurrentPositionAsync({
+      accuracy: Location.Accuracy.High,
+    });
+  } catch (e) {
+    console.log(`[CMDS-GPS] foreground getCurrentPosition error: ${e}`);
+    return;
+  }
+  await postLocationIfLinked(
+    coords,
+    "expo-fg",
+    FOREGROUND_LINKED_CHECK_TTL_MS,
+  );
 }
 
 export type TestPingResult = {
@@ -361,7 +430,7 @@ export async function sendTestPing(): Promise<TestPingResult> {
   let coords: Location.LocationObject;
   try {
     coords = await Location.getCurrentPositionAsync({
-      accuracy: Location.Accuracy.Balanced,
+      accuracy: Location.Accuracy.High,
     });
   } catch (e) {
     return {
@@ -375,20 +444,11 @@ export async function sendTestPing(): Promise<TestPingResult> {
     };
   }
 
-  const payload = {
-    latitude: coords.coords.latitude,
-    longitude: coords.coords.longitude,
-    accuracy: coords.coords.accuracy,
-    altitude: coords.coords.altitude,
-    altitudeAccuracy: coords.coords.altitudeAccuracy,
-    speed: coords.coords.speed,
-    heading: coords.coords.heading,
-    timestamp: coords.timestamp,
-    recorded_at: new Date(coords.timestamp).toISOString(),
-    source: "cmds-mobile-app-test",
-  };
-
-  await postLocation(payload, accessToken);
+  await postLocation(
+    buildPayload(coords, "manual-test"),
+    accessToken,
+    "manual-test",
+  );
   const updated = await getDiagnostics();
   return {
     ok: updated.lastPostStatus

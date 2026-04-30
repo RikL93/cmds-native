@@ -27,6 +27,7 @@ import {
   getDiagnostics,
   getSupabaseAccessToken,
   isBackgroundLocationActive,
+  postForegroundLocation,
   sendTestPing,
   setSupabaseAccessToken,
   startBackgroundLocation,
@@ -296,6 +297,28 @@ export default function Index() {
       cancelled = true;
     };
   }, [permissionState]);
+
+  // Foreground native POST loop — every 10 seconds, send a fresh fix to
+  // /ingest-location with source="expo-fg" so the backend gets data even
+  // when the website's own GPS pipe is throttled.
+  useEffect(() => {
+    if (permissionState !== "granted" || !appActive || Platform.OS === "web") {
+      return;
+    }
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      postForegroundLocation().catch(() => undefined);
+    };
+    // First tick after a few seconds so token + linked check have settled.
+    const initial = setTimeout(tick, 3_000);
+    const handle = setInterval(tick, 10_000);
+    return () => {
+      cancelled = true;
+      clearTimeout(initial);
+      clearInterval(handle);
+    };
+  }, [permissionState, appActive]);
 
   // Foreground GPS watcher: continuously push fresh coordinates into the
   // WebView so the website always has up-to-date location data while open.

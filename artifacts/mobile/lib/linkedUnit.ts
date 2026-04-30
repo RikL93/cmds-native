@@ -96,13 +96,16 @@ export async function fetchLinkedUnitStatus(
     };
 
     const status: LinkedUnitStatus = {
-      linked: !!body.linked && !!body.unit,
+      linked: !!body.linked,
       unit: body.unit ?? null,
       tokenInvalid: false,
       checkedAt,
       httpStatus: response.status,
       error: null,
     };
+    console.log(
+      `[CMDS-GPS] whoami-unit → linked=${status.linked} call_sign=${status.unit?.call_sign ?? "-"}`,
+    );
     await writeCachedStatus(status);
     return status;
   } catch (e) {
