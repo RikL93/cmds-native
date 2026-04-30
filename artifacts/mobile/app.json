@@ -20,7 +20,10 @@
         "NSLocationWhenInUseUsageDescription": "CMDS gebruikt je locatie om diensten via de website aan te bieden.",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmdsevent.nl wanneer je bent ingelogd.",
         "NSLocationAlwaysUsageDescription": "CMDS gebruikt je locatie ook op de achtergrond om GPS-gegevens te delen met cmdsevent.nl wanneer je bent ingelogd.",
-        "UIBackgroundModes": ["location", "fetch"]
+        "UIBackgroundModes": [
+          "location",
+          "fetch"
+        ]
       }
     },
     "android": {
@@ -31,7 +34,12 @@
         "ACCESS_BACKGROUND_LOCATION",
         "FOREGROUND_SERVICE",
         "FOREGROUND_SERVICE_LOCATION",
-        "INTERNET"
+        "INTERNET",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_LOCATION"
       ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/icon.png",
@@ -63,6 +71,12 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "b310a007-0e69-40f8-9a6d-a581d56b3460"
+      }
+    },
+    "owner": "r.lemmens"
   }
 }
