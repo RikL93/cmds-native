@@ -1,0 +1,159 @@
+Context: ik bouw een native Android/iOS WebView-shell rond een webapp
+(CMDS) op https://cmdsevent.nl. De webapp draait op Supabase
+(project ref: txauyjkivyzgxetmadkj). De native shell stuurt
+background-GPS naar deze Edge Function:
+
+  POST https://txauyjkivyzgxetmadkj.supabase.co/functions/v1/ingest-location
+  Authorization: Bearer <Supabase access_token van ingelogde user>
+  Content-Type: application/json
+  Body: { "latitude": <num>, "longitude": <num>, "accuracy": <num|null>,
+          "altitude": <num|null>, "altitudeAccuracy": <num|null>,
+          "speed": <num|null>, "heading": <num|null>,
+          "recorded_at": "<ISO8601>" }
+
+PROBLEEM
+ingest-location antwoordt nu vaak met:
+  200 { "ok": true, "skipped": true, "reason": "no_linked_unit" }
+
+Dat komt doordat de native app aanneemt dat 1 user = 1 GPS-stream.
+In CMDS klopt dat niet:
+  - 1 account (bv. "ambu01") kan op meerdere telefoons ingelogd zijn
+  - de gebruiker kiest IN de webapp ("UnitView") een call sign uit een
+    lijst van eenheden binnen de actieve inzet (event)
+  - pas dán koppelt de webapp die specifieke eenheid aan de user
+  - GPS moet alleen lopen zolang die koppeling bestaat
+
+OPLOSSING: gebruik de sanity-endpoint `whoami-unit`
+
+Er bestaat een lichte read-only endpoint die in 1 call zegt of de
+ingelogde user momenteel een gekoppelde eenheid heeft:
+
+  GET https://txauyjkivyzgxetmadkj.supabase.co/functions/v1/whoami-unit
+  Authorization: Bearer <access_token>
+
+Responses:
+  200 { "linked": false }
+  200 { "linked": true,
+        "unit": { "id": "...", "call_sign": "Ambu-1",
+                  "event_id": "...", "status": "vrij" } }
+  401 { "error": "Unauthorized" }   // token ongeldig/verlopen
+
+Geen apikey-header nodig, geen JWT-decoding nodig in de native app.
+
+GEWENST GEDRAG VAN DE NATIVE APP
+
+A. GPS-uploads (POST naar ingest-location) ALLEEN versturen wanneer
+   `whoami-unit` `linked: true` teruggeeft. Anders skippen.
+
+B. Poll `whoami-unit`:
+     - elke 15s in foreground
+     - elke 60s in background
+   Cache het resultaat tussen polls. Bij 401 → token verlopen,
+   wacht op syncSupabaseToken-event (zie D).
+
+C. Bij `linked: true` upload-interval:
+     - foreground: elke 5s
+     - background: elke 30s
+
+D. Token-bron en refresh:
+   Het Supabase access_token leeft in de WebView-localStorage onder
+   key `sb-txauyjkivyzgxetmadkj-auth-token` als JSON met veld
+   `access_token`. Bij login/logout/token-refresh roept de webapp
+   `window.CMDS_NATIVE.syncSupabaseToken()` aan; gebruik die hook om
+   je in-memory token te verversen en direct opnieuw `whoami-unit`
+   te draaien.
+
+E. Toon in de native UI (en log) duidelijk:
+     "Geen eenheid gekoppeld in CMDS — open de app en kies een call sign"
+   wanneer `linked: false` blijft. Voorkomt dat testers denken dat
+   GPS stuk is.
+
+F. Anti-patterns die je MOET vermijden:
+   - Niet zelf `units.linked_device_id` proberen te schrijven vanuit
+     de native app — dat doet de webapp.
+   - Niet POSTen "voor de zekerheid" als `linked: false` — dat spamt
+     ingest-location en levert alleen no_linked_unit-replies.
+   - Niet aannemen dat 1 device-install = 1 eenheid. Een gebruiker
+     kan tijdens een dienst van eenheid wisselen; herhaal de check.
+
+CONCRETE TAKEN VOOR JOU (REPLIT)
+
+1. Voeg een module `linkedUnit.ts` (of equivalent in jouw stack) toe
+   met:
+     - getLinkedUnit(token): Promise<LinkedUnit | null>
+     - startLinkedUnitWatcher(getToken, onChange): stop()
+   die polling + caching doet zoals beschreven.
+
+2. Pas de background-GPS uploader aan:
+     if (!linkedUnit) { skipPost(); return; }
+     await postLocationToIngestEndpoint(...);
+
+3. Hook `window.CMDS_NATIVE.syncSupabaseToken` zo dat het:
+     a. nieuwe access_token uit localStorage leest
+     b. `whoami-unit` direct opnieuw aanroept
+     c. uploader start/stopt obv resultaat
+
+4. Log per cyclus duidelijk: token aanwezig ja/nee, linked ja/nee +
+   call_sign, laatste POST-status.
+
+EXAMPLE PSEUDO-CODE (TS-stijl, vertaal naar je eigen stack)
+
+  const SUPABASE_URL = 'https://txauyjkivyzgxetmadkj.supabase.co';
+
+  async function getLinkedUnit(token: string) {
+    const r = await fetch(`${SUPABASE_URL}/functions/v1/whoami-unit`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (r.status === 401) return { tokenInvalid: true };
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data.linked ? data.unit : null;
+  }
+
+  async function uploadLoop() {
+    while (running) {
+      const token = readTokenFromWebViewLocalStorage();
+      if (!token) { await sleep(15_000); continue; }
+
+      const unit = await getLinkedUnit(token);
+      if (!unit || (unit as any).tokenInvalid) {
+        log('Geen gekoppelde eenheid — skip POST');
+        await sleep(inBackground ? 60_000 : 15_000);
+        continue;
+      }
+
+      const pos = await getCurrentPosition();
+      await fetch(`${SUPABASE_URL}/functions/v1/ingest-location`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          latitude:  pos.coords.latitude,
+          longitude: pos.coords.longitude,
+          accuracy:  pos.coords.accuracy,
+          altitude:  pos.coords.altitude,
+          altitudeAccuracy: pos.coords.altitudeAccuracy,
+          speed:     pos.coords.speed,
+          heading:   pos.coords.heading,
+          recorded_at: new Date(pos.timestamp).toISOString(),
+        }),
+      });
+
+      await sleep(inBackground ? 30_000 : 5_000);
+    }
+  }
+
+ACCEPTATIECRITERIA
+- Wanneer een gebruiker NIET in UnitView een call sign heeft gekozen,
+  POST de native app niets en logt "geen gekoppelde eenheid".
+- Zodra de gebruiker in CMDS koppelt, begint de native app binnen
+  uiterlijk 15s met POSTen.
+- Zodra de gebruiker in CMDS ontkoppelt of status op "vrij" zet,
+  stopt de native app binnen uiterlijk 15s met POSTen.
+- Bij token-refresh (syncSupabaseToken) blijft uploaden ononderbroken
+  doorlopen.
+
+Implementeer dit en geef me de gewijzigde bestanden terug.

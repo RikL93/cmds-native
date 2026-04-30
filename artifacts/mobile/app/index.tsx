@@ -2,6 +2,8 @@ import * as Location from "expo-location";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  AppState,
+  type AppStateStatus,
   Linking,
   Modal,
   Platform,
@@ -15,7 +17,9 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import {
   clearDiagnostics,
+  diagnosticsPatchFromLinkedStatus,
   getDiagnostics,
+  getSupabaseAccessToken,
   isBackgroundLocationActive,
   sendTestPing,
   setSupabaseAccessToken,
@@ -23,9 +27,11 @@ import {
   stopBackgroundLocation,
   type Diagnostics,
 } from "@/lib/backgroundLocation";
+import { fetchLinkedUnitStatus } from "@/lib/linkedUnit";
 
 const TARGET_URL = "https://cmdsevent.nl";
 const SUPABASE_PROJECT_REF = "txauyjkivyzgxetmadkj";
+const FOREGROUND_LINKED_POLL_MS = 15_000;
 
 const WebView: typeof import("react-native-webview").WebView | null =
   Platform.OS === "web"
@@ -111,6 +117,33 @@ function formatTimeAgo(iso: string | null): string {
   return `${hr}u ${min % 60}m geleden`;
 }
 
+function linkedStatusLabel(d: Diagnostics | null): {
+  text: string;
+  good: boolean | null;
+} {
+  if (!d || !d.lastLinkedStatus) {
+    return { text: "nog niet gecontroleerd", good: null };
+  }
+  switch (d.lastLinkedStatus) {
+    case "linked":
+      return {
+        text: `Ja — ${d.lastLinkedCallSign ?? "(onbekend)"}`,
+        good: true,
+      };
+    case "no_unit":
+      return {
+        text: "Nee — kies een call sign in CMDS (UnitView)",
+        good: false,
+      };
+    case "token_invalid":
+      return { text: "Token verlopen — login op website", good: false };
+    case "error":
+      return { text: d.lastLinkedError ?? "fout", good: false };
+    default:
+      return { text: d.lastLinkedStatus, good: null };
+  }
+}
+
 export default function Index() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<InstanceType<NonNullable<typeof WebView>>>(null);
@@ -125,6 +158,7 @@ export default function Index() {
   const [serviceActive, setServiceActive] = useState(false);
   const [testRunning, setTestRunning] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
+  const [appActive, setAppActive] = useState(true);
 
   const refreshDiagnostics = useCallback(async () => {
     const [d, active] = await Promise.all([
@@ -141,6 +175,47 @@ export default function Index() {
     const handle = setInterval(refreshDiagnostics, 2000);
     return () => clearInterval(handle);
   }, [showDiagnostics, refreshDiagnostics]);
+
+  // Track foreground/background to throttle the linked-unit poll loop.
+  useEffect(() => {
+    const sub = AppState.addEventListener(
+      "change",
+      (next: AppStateStatus) => {
+        setAppActive(next === "active");
+      },
+    );
+    return () => sub.remove();
+  }, []);
+
+  // Foreground polling of whoami-unit so the diagnostics screen and the
+  // background task always have a fresh "linked" answer cached.
+  useEffect(() => {
+    if (permissionState !== "granted" || !appActive) return;
+    let cancelled = false;
+
+    const poll = async () => {
+      const token = await getSupabaseAccessToken();
+      if (!token) return;
+      const status = await fetchLinkedUnitStatus(token);
+      if (cancelled) return;
+      // Persist into diagnostics so the screen reflects it without a manual
+      // refresh and the background task reuses the cache.
+      const patch = diagnosticsPatchFromLinkedStatus(status);
+      const current = await getDiagnostics();
+      const merged = { ...current, ...patch };
+      // Use private write through getDiagnostics + AsyncStorage indirectly
+      // by re-using the linked-unit module's writeCachedStatus side-effect
+      // is enough; here we just trigger a UI refresh.
+      setDiagnostics(merged);
+    };
+
+    poll();
+    const handle = setInterval(poll, FOREGROUND_LINKED_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [permissionState, appActive]);
 
   const requestPermissions = useCallback(async () => {
     setPermissionState("checking");
@@ -245,7 +320,17 @@ export default function Index() {
           typeof message.token === "string" && message.token.length > 0
             ? message.token
             : null;
-        setSupabaseAccessToken(token).catch(() => undefined);
+        // Save token, then immediately re-check linked unit so background
+        // task picks up the freshest answer without waiting for next poll.
+        setSupabaseAccessToken(token)
+          .then(async () => {
+            if (!token) return;
+            const status = await fetchLinkedUnitStatus(token);
+            const patch = diagnosticsPatchFromLinkedStatus(status);
+            const current = await getDiagnostics();
+            setDiagnostics({ ...current, ...patch });
+          })
+          .catch(() => undefined);
       }
     } catch {
       // Ignore malformed messages.
@@ -261,8 +346,14 @@ export default function Index() {
     setTestResult(null);
     try {
       const result = await sendTestPing();
-      if (result.ok) {
-        setTestResult(`✓ OK (HTTP ${result.status})\n${result.body || ""}`);
+      if (result.skipped) {
+        setTestResult(
+          `↷ Overgeslagen — ${result.error ?? result.skipReason ?? "onbekend"}`,
+        );
+      } else if (result.ok) {
+        setTestResult(
+          `✓ OK (HTTP ${result.status}) — eenheid: ${result.linkedCallSign ?? "?"}\n${result.body || ""}`,
+        );
       } else {
         setTestResult(
           `✗ Mislukt — ${result.error ?? "onbekende fout"}\n${result.body || ""}`,
@@ -341,6 +432,8 @@ export default function Index() {
       </View>
     );
   }
+
+  const linkedLabel = linkedStatusLabel(diagnostics);
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -427,6 +520,15 @@ export default function Index() {
               value={formatTimeAgo(diagnostics?.lastTokenSeenAt ?? null)}
             />
             <DiagRow
+              label="Eenheid gekoppeld"
+              value={linkedLabel.text}
+              good={linkedLabel.good}
+            />
+            <DiagRow
+              label="Eenheid laatst gecontroleerd"
+              value={formatTimeAgo(diagnostics?.lastLinkedCheckAt ?? null)}
+            />
+            <DiagRow
               label="Laatste GPS fix"
               value={formatTimeAgo(
                 diagnostics?.lastBackgroundFixAt ?? null,
@@ -458,9 +560,16 @@ export default function Index() {
               }
             />
             <DiagRow
-              label="Geslaagd / mislukt"
-              value={`${diagnostics?.postSuccessCount ?? 0} / ${diagnostics?.postFailureCount ?? 0}`}
+              label="POSTs OK / fout / overgeslagen"
+              value={`${diagnostics?.postSuccessCount ?? 0} / ${diagnostics?.postFailureCount ?? 0} / ${diagnostics?.postSkippedCount ?? 0}`}
             />
+            {diagnostics?.lastSkipReason && (
+              <DiagRow
+                label="Reden laatste skip"
+                value={diagnostics.lastSkipReason}
+                multiline
+              />
+            )}
             {diagnostics?.lastPostError && (
               <DiagRow
                 label="Laatste fout"

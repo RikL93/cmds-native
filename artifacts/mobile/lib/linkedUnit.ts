@@ -1,0 +1,137 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export const WHOAMI_ENDPOINT =
+  "https://txauyjkivyzgxetmadkj.supabase.co/functions/v1/whoami-unit";
+
+const STATUS_STORAGE_KEY = "cmds.linkedUnit";
+
+export type LinkedUnit = {
+  id: string;
+  call_sign: string;
+  event_id: string | null;
+  status: string | null;
+};
+
+export type LinkedUnitStatus = {
+  linked: boolean;
+  unit: LinkedUnit | null;
+  tokenInvalid: boolean;
+  checkedAt: string;
+  httpStatus: number | null;
+  error: string | null;
+};
+
+const EMPTY_STATUS: LinkedUnitStatus = {
+  linked: false,
+  unit: null,
+  tokenInvalid: false,
+  checkedAt: "",
+  httpStatus: null,
+  error: null,
+};
+
+export async function getCachedLinkedUnitStatus(): Promise<LinkedUnitStatus | null> {
+  try {
+    const raw = await AsyncStorage.getItem(STATUS_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return { ...EMPTY_STATUS, ...parsed };
+  } catch {
+    return null;
+  }
+}
+
+async function writeCachedStatus(status: LinkedUnitStatus): Promise<void> {
+  try {
+    await AsyncStorage.setItem(STATUS_STORAGE_KEY, JSON.stringify(status));
+  } catch {
+    // Cache write failures are non-critical.
+  }
+}
+
+export async function clearLinkedUnitCache(): Promise<void> {
+  await AsyncStorage.removeItem(STATUS_STORAGE_KEY);
+}
+
+export async function fetchLinkedUnitStatus(
+  token: string,
+): Promise<LinkedUnitStatus> {
+  const checkedAt = new Date().toISOString();
+  try {
+    const response = await fetch(WHOAMI_ENDPOINT, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    if (response.status === 401) {
+      const status: LinkedUnitStatus = {
+        linked: false,
+        unit: null,
+        tokenInvalid: true,
+        checkedAt,
+        httpStatus: 401,
+        error: "Unauthorized — token verlopen",
+      };
+      await writeCachedStatus(status);
+      return status;
+    }
+
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => "");
+      const status: LinkedUnitStatus = {
+        linked: false,
+        unit: null,
+        tokenInvalid: false,
+        checkedAt,
+        httpStatus: response.status,
+        error: `HTTP ${response.status} ${bodyText.slice(0, 120)}`,
+      };
+      await writeCachedStatus(status);
+      return status;
+    }
+
+    const body = (await response.json()) as {
+      linked?: boolean;
+      unit?: LinkedUnit | null;
+    };
+
+    const status: LinkedUnitStatus = {
+      linked: !!body.linked && !!body.unit,
+      unit: body.unit ?? null,
+      tokenInvalid: false,
+      checkedAt,
+      httpStatus: response.status,
+      error: null,
+    };
+    await writeCachedStatus(status);
+    return status;
+  } catch (e) {
+    const status: LinkedUnitStatus = {
+      linked: false,
+      unit: null,
+      tokenInvalid: false,
+      checkedAt,
+      httpStatus: null,
+      error: e instanceof Error ? e.message : String(e),
+    };
+    await writeCachedStatus(status);
+    return status;
+  }
+}
+
+/**
+ * Returns a cached status if it's fresher than `maxAgeMs`, otherwise refreshes.
+ */
+export async function getOrRefreshLinkedUnitStatus(
+  token: string,
+  maxAgeMs: number,
+): Promise<LinkedUnitStatus> {
+  const cached = await getCachedLinkedUnitStatus();
+  if (cached && cached.checkedAt) {
+    const age = Date.now() - new Date(cached.checkedAt).getTime();
+    if (age >= 0 && age < maxAgeMs && !cached.tokenInvalid) {
+      return cached;
+    }
+  }
+  return fetchLinkedUnitStatus(token);
+}
