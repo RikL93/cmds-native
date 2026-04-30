@@ -3,7 +3,9 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Linking,
+  Modal,
   Platform,
+  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
@@ -12,9 +14,14 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import {
+  clearDiagnostics,
+  getDiagnostics,
+  isBackgroundLocationActive,
+  sendTestPing,
   setSupabaseAccessToken,
   startBackgroundLocation,
   stopBackgroundLocation,
+  type Diagnostics,
 } from "@/lib/backgroundLocation";
 
 const TARGET_URL = "https://cmdsevent.nl";
@@ -92,6 +99,18 @@ const INJECTED_BRIDGE = `
 })();
 `;
 
+function formatTimeAgo(iso: string | null): string {
+  if (!iso) return "nooit";
+  const then = new Date(iso).getTime();
+  const diff = Math.max(0, Date.now() - then);
+  const sec = Math.round(diff / 1000);
+  if (sec < 60) return `${sec}s geleden`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ${sec % 60}s geleden`;
+  const hr = Math.floor(min / 60);
+  return `${hr}u ${min % 60}m geleden`;
+}
+
 export default function Index() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<InstanceType<NonNullable<typeof WebView>>>(null);
@@ -99,6 +118,29 @@ export default function Index() {
     useState<PermissionState>("checking");
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const [, setCanGoBack] = useState(false);
+
+  // Diagnostics state
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
+  const [serviceActive, setServiceActive] = useState(false);
+  const [testRunning, setTestRunning] = useState(false);
+  const [testResult, setTestResult] = useState<string | null>(null);
+
+  const refreshDiagnostics = useCallback(async () => {
+    const [d, active] = await Promise.all([
+      getDiagnostics(),
+      isBackgroundLocationActive(),
+    ]);
+    setDiagnostics(d);
+    setServiceActive(active);
+  }, []);
+
+  useEffect(() => {
+    if (!showDiagnostics) return;
+    refreshDiagnostics();
+    const handle = setInterval(refreshDiagnostics, 2000);
+    return () => clearInterval(handle);
+  }, [showDiagnostics, refreshDiagnostics]);
 
   const requestPermissions = useCallback(async () => {
     setPermissionState("checking");
@@ -214,6 +256,30 @@ export default function Index() {
     Linking.openSettings().catch(() => undefined);
   }, []);
 
+  const runTestPing = useCallback(async () => {
+    setTestRunning(true);
+    setTestResult(null);
+    try {
+      const result = await sendTestPing();
+      if (result.ok) {
+        setTestResult(`✓ OK (HTTP ${result.status})\n${result.body || ""}`);
+      } else {
+        setTestResult(
+          `✗ Mislukt — ${result.error ?? "onbekende fout"}\n${result.body || ""}`,
+        );
+      }
+      await refreshDiagnostics();
+    } finally {
+      setTestRunning(false);
+    }
+  }, [refreshDiagnostics]);
+
+  const handleClearDiagnostics = useCallback(async () => {
+    await clearDiagnostics();
+    setTestResult(null);
+    await refreshDiagnostics();
+  }, [refreshDiagnostics]);
+
   if (permissionState === "checking") {
     return (
       <View style={[styles.center, { paddingTop: insets.top }]}>
@@ -234,8 +300,8 @@ export default function Index() {
         <Text style={styles.title}>Locatietoegang vereist</Text>
         <Text style={styles.body}>
           {permissionState === "background-denied"
-            ? 'Sta locatie "Altijd toestaan" toe zodat de app op de achtergrond GPS kan delen met cmds.nl.'
-            : "Deze app heeft locatietoegang nodig om correct te werken met cmds.nl."}
+            ? 'Sta locatie "Altijd toestaan" toe zodat de app op de achtergrond GPS kan delen met cmdsevent.nl.'
+            : "Deze app heeft locatietoegang nodig om correct te werken met cmdsevent.nl."}
         </Text>
 
         <TouchableOpacity
@@ -308,6 +374,180 @@ export default function Index() {
           <ActivityIndicator size="large" color="#3b82f6" />
         </View>
       )}
+
+      {/* Diagnostics floating button */}
+      <TouchableOpacity
+        style={[styles.diagButton, { bottom: insets.bottom + 12 }]}
+        onPress={() => setShowDiagnostics(true)}
+        activeOpacity={0.8}
+      >
+        <Text style={styles.diagButtonText}>GPS</Text>
+      </TouchableOpacity>
+
+      <Modal
+        visible={showDiagnostics}
+        animationType="slide"
+        onRequestClose={() => setShowDiagnostics(false)}
+      >
+        <View
+          style={[
+            styles.modalContainer,
+            { paddingTop: insets.top + 12, paddingBottom: insets.bottom + 12 },
+          ]}
+        >
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>GPS diagnose</Text>
+            <TouchableOpacity
+              onPress={() => setShowDiagnostics(false)}
+              style={styles.modalClose}
+            >
+              <Text style={styles.modalCloseText}>Sluiten</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView contentContainerStyle={styles.modalScroll}>
+            <DiagRow
+              label="Service draait"
+              value={serviceActive ? "Ja ✓" : "Nee ✗"}
+              good={serviceActive}
+            />
+            <DiagRow
+              label="Token aanwezig"
+              value={
+                diagnostics && diagnostics.lastTokenLength > 0
+                  ? `Ja (${diagnostics.lastTokenLength} tekens)`
+                  : "Nee — log in op de website"
+              }
+              good={
+                !!diagnostics && diagnostics.lastTokenLength > 0
+              }
+            />
+            <DiagRow
+              label="Token laatst gezien"
+              value={formatTimeAgo(diagnostics?.lastTokenSeenAt ?? null)}
+            />
+            <DiagRow
+              label="Laatste GPS fix"
+              value={formatTimeAgo(
+                diagnostics?.lastBackgroundFixAt ?? null,
+              )}
+            />
+            {diagnostics?.lastBackgroundLat != null &&
+              diagnostics?.lastBackgroundLng != null && (
+                <DiagRow
+                  label="Laatste coördinaten"
+                  value={`${diagnostics.lastBackgroundLat.toFixed(5)}, ${diagnostics.lastBackgroundLng.toFixed(5)}`}
+                />
+              )}
+            <DiagRow
+              label="Laatste POST"
+              value={formatTimeAgo(diagnostics?.lastPostAt ?? null)}
+            />
+            <DiagRow
+              label="Laatste status"
+              value={
+                diagnostics?.lastPostStatus
+                  ? `HTTP ${diagnostics.lastPostStatus}`
+                  : diagnostics?.lastPostError ?? "—"
+              }
+              good={
+                diagnostics?.lastPostStatus
+                  ? diagnostics.lastPostStatus >= 200 &&
+                    diagnostics.lastPostStatus < 300
+                  : null
+              }
+            />
+            <DiagRow
+              label="Geslaagd / mislukt"
+              value={`${diagnostics?.postSuccessCount ?? 0} / ${diagnostics?.postFailureCount ?? 0}`}
+            />
+            {diagnostics?.lastPostError && (
+              <DiagRow
+                label="Laatste fout"
+                value={diagnostics.lastPostError}
+                good={false}
+                multiline
+              />
+            )}
+            {diagnostics?.lastPostBody && (
+              <DiagRow
+                label="Server antwoord"
+                value={diagnostics.lastPostBody}
+                multiline
+              />
+            )}
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={styles.primaryButton}
+                onPress={runTestPing}
+                disabled={testRunning}
+                activeOpacity={0.8}
+              >
+                {testRunning ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <Text style={styles.primaryButtonText}>
+                    Test nu een POST
+                  </Text>
+                )}
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.secondaryButton}
+                onPress={refreshDiagnostics}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.secondaryButtonText}>Vernieuwen</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.secondaryButton}
+                onPress={handleClearDiagnostics}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.secondaryButtonText}>
+                  Diagnose wissen
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {testResult != null && (
+              <View style={styles.testResultBox}>
+                <Text style={styles.testResultText}>{testResult}</Text>
+              </View>
+            )}
+          </ScrollView>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+function DiagRow({
+  label,
+  value,
+  good,
+  multiline,
+}: {
+  label: string;
+  value: string;
+  good?: boolean | null;
+  multiline?: boolean;
+}) {
+  const valueColor =
+    good === true ? "#22c55e" : good === false ? "#ef4444" : "#e5e7eb";
+  return (
+    <View style={styles.diagRow}>
+      <Text style={styles.diagLabel}>{label}</Text>
+      <Text
+        style={[
+          multiline ? styles.diagValueMulti : styles.diagValue,
+          { color: valueColor },
+        ]}
+      >
+        {value}
+      </Text>
     </View>
   );
 }
@@ -384,5 +624,91 @@ const styles = StyleSheet.create({
     color: "#cbd5f5",
     fontSize: 15,
     fontWeight: "500",
+  },
+  diagButton: {
+    position: "absolute",
+    right: 12,
+    backgroundColor: "rgba(11, 29, 58, 0.85)",
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: "#3b82f6",
+  },
+  diagButtonText: {
+    color: "#ffffff",
+    fontSize: 12,
+    fontWeight: "700",
+    letterSpacing: 1,
+  },
+  modalContainer: {
+    flex: 1,
+    backgroundColor: "#0b1d3a",
+    paddingHorizontal: 20,
+  },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  modalTitle: {
+    color: "#ffffff",
+    fontSize: 20,
+    fontWeight: "700",
+  },
+  modalClose: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#334e8a",
+  },
+  modalCloseText: {
+    color: "#cbd5f5",
+    fontSize: 14,
+    fontWeight: "500",
+  },
+  modalScroll: {
+    paddingBottom: 24,
+  },
+  diagRow: {
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#1e3a6e",
+  },
+  diagLabel: {
+    color: "#94a3b8",
+    fontSize: 12,
+    textTransform: "uppercase",
+    marginBottom: 4,
+    letterSpacing: 0.5,
+  },
+  diagValue: {
+    color: "#e5e7eb",
+    fontSize: 15,
+    fontWeight: "500",
+  },
+  diagValueMulti: {
+    color: "#e5e7eb",
+    fontSize: 13,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+  },
+  modalActions: {
+    marginTop: 24,
+    alignItems: "center",
+  },
+  testResultBox: {
+    marginTop: 20,
+    padding: 14,
+    backgroundColor: "#082043",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#1e3a6e",
+  },
+  testResultText: {
+    color: "#e5e7eb",
+    fontSize: 13,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
   },
 });
