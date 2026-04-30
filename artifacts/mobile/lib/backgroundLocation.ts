@@ -158,6 +158,15 @@ async function postLocation(
   source: string,
 ): Promise<void> {
   const startedAt = Date.now();
+  console.log("POST ingest-location", {
+    url: LOCATION_ENDPOINT,
+    hasToken: !!accessToken,
+    tokenLength: accessToken?.length ?? 0,
+    source,
+    payloadKeys: Object.keys(payload),
+    lat: payload.latitude,
+    lng: payload.longitude,
+  });
   try {
     const response = await fetch(LOCATION_ENDPOINT, {
       method: "POST",
@@ -235,8 +244,10 @@ export async function postLocationIfLinked(
   source: string,
   linkedTtlMs: number,
 ): Promise<void> {
+  console.log(`[CMDS-GPS] postLocationIfLinked called (source=${source})`);
   const accessToken = await getSupabaseAccessToken();
   if (!accessToken) {
+    console.log("POST ingest-location SKIP: no token", { source });
     await recordSkip("geen token — log in op de website", source);
     return;
   }
@@ -265,6 +276,9 @@ export async function postLocationIfLinked(
 if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
   TaskManager.defineTask(LOCATION_TASK_NAME, async (body) => {
     const { data, error } = body as BackgroundTaskBody;
+    console.log(
+      `[CMDS-GPS] background task fired (locations=${data?.locations?.length ?? 0}, error=${error?.message ?? "none"})`,
+    );
 
     if (error) {
       console.log(`[CMDS-GPS] background task error: ${error.message}`);
@@ -276,6 +290,7 @@ if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
 
     const locations = data?.locations;
     if (!locations || locations.length === 0) {
+      console.log("[CMDS-GPS] background task fired but no locations in payload");
       return;
     }
 

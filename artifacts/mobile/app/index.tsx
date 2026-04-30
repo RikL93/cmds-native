@@ -306,9 +306,14 @@ export default function Index() {
       return;
     }
     let cancelled = false;
+    let tickCount = 0;
     const tick = () => {
       if (cancelled) return;
-      postForegroundLocation().catch(() => undefined);
+      tickCount += 1;
+      console.log(`[CMDS-GPS] foreground tick #${tickCount} (every 10s)`);
+      postForegroundLocation().catch((e) =>
+        console.log(`[CMDS-GPS] foreground tick error: ${e}`),
+      );
     };
     // First tick after a few seconds so token + linked check have settled.
     const initial = setTimeout(tick, 3_000);
