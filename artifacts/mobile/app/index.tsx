@@ -32,6 +32,7 @@ import {
   setSupabaseAccessToken,
   startBackgroundLocation,
   stopBackgroundLocation,
+  updateAccessToken,
   updateLastKnownLocation,
   type Diagnostics,
 } from "@/lib/backgroundLocation";
@@ -96,6 +97,22 @@ const INJECTED_BRIDGE = `
     stopBackgroundGPS: function() { send({ type: 'stop_gps' }); },
     syncSupabaseToken: syncToken,
     lastLocation: undefined,
+
+    // Called by the Lovable webapp whenever Supabase refreshes the session.
+    // payload: { accessToken, refreshToken, expiresAt (unix epoch s), userId }
+    // Backwards compatible: old syncSupabaseToken() keeps working as fallback.
+    onSupabaseTokenRefreshed: function(payload) {
+      try {
+        if (!payload || !payload.accessToken) return;
+        lastToken = payload.accessToken; // suppress duplicate syncToken event
+        send({ type: 'token_refreshed', payload: {
+          accessToken: payload.accessToken,
+          refreshToken: payload.refreshToken || null,
+          expiresAt: payload.expiresAt || null,
+          userId: payload.userId || null,
+        }});
+      } catch (e) {}
+    },
   };
 
   syncToken();
@@ -299,37 +316,13 @@ export default function Index() {
     };
   }, [permissionState]);
 
-  // Foreground native POST loop — every 10 seconds, send a fresh fix to
-  // /ingest-location with source="expo-fg" so the backend gets data even
-  // when the website's own GPS pipe is throttled.
-  useEffect(() => {
-    if (permissionState !== "granted" || !appActive || Platform.OS === "web") {
-      return;
-    }
-    let cancelled = false;
-    let tickCount = 0;
-    const tick = () => {
-      if (cancelled) return;
-      tickCount += 1;
-      console.log(`[CMDS-GPS] foreground tick #${tickCount} (every 10s)`);
-      postForegroundLocation().catch((e) =>
-        console.log(`[CMDS-GPS] foreground tick error: ${e}`),
-      );
-    };
-    // First tick after a few seconds so token + linked check have settled.
-    const initial = setTimeout(tick, 3_000);
-    const handle = setInterval(tick, 10_000);
-    return () => {
-      cancelled = true;
-      clearTimeout(initial);
-      clearInterval(handle);
-    };
-  }, [permissionState, appActive]);
-
   // Foreground GPS watcher: continuously push fresh coordinates into the
-  // WebView so the website always has up-to-date location data while open.
+  // WebView and throttle-POST to /ingest-location every ~10s.
+  // The setInterval(10s) ticker has been removed — the watcher callback
+  // drives both the WebView injection and the POST to avoid double-triggers.
   useEffect(() => {
-    if (permissionState !== "granted" || Platform.OS === "web") return;
+    if (permissionState !== "granted" || !appActive || Platform.OS === "web")
+      return;
 
     let cancelled = false;
     let subscription: Location.LocationSubscription | null = null;
@@ -344,9 +337,16 @@ export default function Index() {
           },
           (location) => {
             if (cancelled) return;
-            // FIX 1: update shared cache so the POST loop uses this fix
-            // directly instead of calling getCurrentPositionAsync().
+
+            // Keep the shared module-level cache fresh for the background task.
             updateLastKnownLocation(location);
+
+            // Throttled POST (≈every 10s) — replaces the old setInterval tick.
+            postForegroundLocation(location).catch((e) =>
+              console.log(`[CMDS-GPS] foreground watcher POST error: ${e}`),
+            );
+
+            // Inject coordinates into the WebView so cmdsevent.nl can read them.
             const coords = {
               latitude: location.coords.latitude,
               longitude: location.coords.longitude,
@@ -375,7 +375,7 @@ export default function Index() {
       cancelled = true;
       subscription?.remove();
     };
-  }, [permissionState]);
+  }, [permissionState, appActive]);
 
   const handleNavigationStateChange = useCallback(
     (navState: WebViewNavigation) => {
@@ -409,6 +409,48 @@ export default function Index() {
             setDiagnostics({ ...current, ...patch });
           })
           .catch(() => undefined);
+      } else if (message.type === "token_refreshed") {
+        // Fired by window.CMDS_NATIVE.onSupabaseTokenRefreshed() — Lovable
+        // webapp pushes the fresh token the moment Supabase auto-refreshes,
+        // so the native POST loop gets the new token without waiting for the
+        // next syncToken polling tick.
+        const payload = message.payload as {
+          accessToken?: string;
+          refreshToken?: string | null;
+          expiresAt?: number | null;
+        } | null;
+        const freshToken =
+          typeof payload?.accessToken === "string" &&
+          payload.accessToken.length > 0
+            ? payload.accessToken
+            : null;
+        if (!freshToken) return;
+
+        // Update in-memory cache immediately — no AsyncStorage round-trip
+        // needed before the next POST tick.
+        updateAccessToken(freshToken);
+
+        // Persist everything to AsyncStorage in the background.
+        (async () => {
+          await setSupabaseAccessToken(freshToken);
+          if (typeof payload?.refreshToken === "string") {
+            await AsyncStorage.setItem(
+              "cmds.supabaseRefreshToken",
+              payload.refreshToken,
+            );
+          }
+          if (payload?.expiresAt != null) {
+            await AsyncStorage.setItem(
+              "cmds.supabaseTokenExpiresAt",
+              String(payload.expiresAt),
+            );
+          }
+          // Re-check linked unit so the new token is validated immediately.
+          const status = await fetchLinkedUnitStatus(freshToken);
+          const patch = diagnosticsPatchFromLinkedStatus(status);
+          const current = await getDiagnostics();
+          setDiagnostics({ ...current, ...patch });
+        })().catch(() => undefined);
       }
     } catch {
       // Ignore malformed messages.

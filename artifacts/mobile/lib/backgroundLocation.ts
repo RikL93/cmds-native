@@ -18,7 +18,19 @@ export const SUPABASE_TOKEN_STORAGE_KEY = "cmds.supabase.access_token";
 export const DIAGNOSTICS_STORAGE_KEY = "cmds.diagnostics";
 
 const BACKGROUND_LINKED_CHECK_TTL_MS = 30_000;
-const FOREGROUND_LINKED_CHECK_TTL_MS = 15_000;
+const FOREGROUND_LINKED_CHECK_TTL_MS = 60_000; // cache whoami 60s — saves ~6 req/min/device
+
+// ---------------------------------------------------------------------------
+// In-memory access-token cache.
+// Updated immediately by updateAccessToken() (called from the bridge event
+// handler in app/index.tsx when the webapp fires onSupabaseTokenRefreshed).
+// Avoids an AsyncStorage round-trip on every POST tick.
+// ---------------------------------------------------------------------------
+let _currentAccessToken: string | null = null;
+
+export function updateAccessToken(token: string | null): void {
+  _currentAccessToken = token;
+}
 
 type BackgroundTaskBody = {
   data?: { locations?: Location.LocationObject[] };
@@ -74,6 +86,12 @@ const DEFAULT_DIAGNOSTICS: Diagnostics = {
 // getCurrentPositionAsync(), which can hang for 30-60s without a satellite fix.
 // ---------------------------------------------------------------------------
 let _lastKnownLocation: Location.LocationObject | null = null;
+
+// Throttle: postForegroundLocation() is now called directly from the watcher
+// callback (every ~5s). We only actually POST every 10s so the backend sees
+// roughly the same rate as before without a separate setInterval.
+let _lastForegroundPostTime = 0;
+const FOREGROUND_POST_THROTTLE_MS = 10_000;
 
 export function updateLastKnownLocation(loc: Location.LocationObject): void {
   _lastKnownLocation = loc;
@@ -132,6 +150,7 @@ export function diagnosticsPatchFromLinkedStatus(
 export async function setSupabaseAccessToken(
   token: string | null,
 ): Promise<void> {
+  _currentAccessToken = token; // keep in-memory cache in sync
   if (token && token.length > 0) {
     await AsyncStorage.setItem(SUPABASE_TOKEN_STORAGE_KEY, token);
     await patchDiagnostics({
@@ -145,7 +164,11 @@ export async function setSupabaseAccessToken(
 }
 
 export async function getSupabaseAccessToken(): Promise<string | null> {
-  return AsyncStorage.getItem(SUPABASE_TOKEN_STORAGE_KEY);
+  // Prefer in-memory cache (updated synchronously by bridge events).
+  if (_currentAccessToken !== null) return _currentAccessToken;
+  const stored = await AsyncStorage.getItem(SUPABASE_TOKEN_STORAGE_KEY);
+  _currentAccessToken = stored; // prime cache on cold start
+  return stored;
 }
 
 /**
@@ -178,23 +201,26 @@ async function postLocation(
   source: string,
 ): Promise<number | null> {
   const startedAt = Date.now();
-  console.log("POST ingest-location", {
-    url: LOCATION_ENDPOINT,
-    hasToken: !!accessToken,
-    tokenLength: accessToken?.length ?? 0,
-    source,
-    lat: payload.latitude,
-    lng: payload.longitude,
-  });
+  console.log(
+    `[CMDS-GPS] before-fetch ingest-location lat=${payload.latitude} lng=${payload.longitude} source=${source} tokenLen=${accessToken.length}`,
+  );
   try {
-    const response = await fetch(LOCATION_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify(payload),
-    });
+    const ctrl = new AbortController();
+    const abortTimer = setTimeout(() => ctrl.abort(), 15_000);
+    let response: Response;
+    try {
+      response = await fetch(LOCATION_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify(payload),
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(abortTimer);
+    }
     let bodyText = "";
     try {
       bodyText = await response.text();
@@ -203,7 +229,7 @@ async function postLocation(
     }
     const took = Date.now() - startedAt;
     console.log(
-      `[CMDS-GPS] POST /ingest-location → status=${response.status}, body=${bodyText.slice(0, 200)}, took=${took}ms (source=${source})`,
+      `[CMDS-GPS] after-fetch ingest-location status=${response.status} ms=${took} body=${bodyText.slice(0, 120)} source=${source}`,
     );
     const current = await getDiagnostics();
     if (response.ok) {
@@ -401,31 +427,24 @@ export async function isBackgroundLocationActive(): Promise<boolean> {
 }
 
 /**
- * FIX 3: Uses _lastKnownLocation from the watcher instead of calling
- * getCurrentPositionAsync(), which can hang indefinitely with High accuracy
- * when GPS satellite signal is weak (indoors, basement, cold start).
+ * FIX 3: Called directly from the watchPositionAsync callback (every ~5s).
+ * Throttles to one POST per FOREGROUND_POST_THROTTLE_MS so the backend
+ * receives ≈1 update per 10s — identical to the old setInterval approach
+ * but without a second concurrent ticker causing duplicate triggers.
  *
- * Called from the foreground 10s interval in app/index.tsx.
+ * Uses the location passed in directly (already the freshest fix) instead
+ * of reading from _lastKnownLocation, so there is no staleness window.
  */
-export async function postForegroundLocation(): Promise<void> {
+export async function postForegroundLocation(
+  location: Location.LocationObject,
+): Promise<void> {
   if (Platform.OS === "web") return;
 
-  const location = _lastKnownLocation;
-  if (!location) {
-    console.log(
-      "[CMDS-GPS] postForegroundLocation: no cached location yet — skipping",
-    );
-    return;
+  const now = Date.now();
+  if (now - _lastForegroundPostTime < FOREGROUND_POST_THROTTLE_MS) {
+    return; // throttled — watcher fires faster than our desired POST rate
   }
-
-  // Only post if the fix is reasonably fresh (less than 60s old).
-  const ageMs = Date.now() - location.timestamp;
-  if (ageMs > 60_000) {
-    console.log(
-      `[CMDS-GPS] postForegroundLocation: cached location is ${Math.round(ageMs / 1000)}s old — skipping`,
-    );
-    return;
-  }
+  _lastForegroundPostTime = now;
 
   await postLocationIfLinked(location, "expo-fg", FOREGROUND_LINKED_CHECK_TTL_MS);
 }

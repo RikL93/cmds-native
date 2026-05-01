@@ -1,0 +1,53 @@
+Aanvullingen op de drie GPS-fixes — graag verwerken
+
+De drie fixes (lastKnownLocation, 401-retry, POST in watcher-callback) zijn correct doorgevoerd. Lovable heeft het bridge-contract uitgebreid en heeft daarnaast vier kleine aanvullingen geadviseerd. Voeg per fix het volgende toe:
+
+Aanvulling op Fix 1 (lastKnownLocation)
+Voeg een AbortController met 15s timeout toe aan álle fetch()-calls naar ingest-location en whoami-unit. Een trage of vastlopende mobiele dataverbinding kan de POST-loop nu nog steeds laten hangen, zelfs nu getCurrentPositionAsync is geëlimineerd.
+
+
+const ctrl = new AbortController();
+const timer = setTimeout(() => ctrl.abort(), 15000);
+try {
+  const res = await fetch(url, { ..., signal: ctrl.signal });
+  // ...
+} finally {
+  clearTimeout(timer);
+}
+Aanvulling op Fix 2 (401-retry met token re-read)
+Lovable webapp pusht nu actief het verse token via een nieuw bridge-event. Implementeer aan de native kant:
+
+
+// In de WebView injection / bridge-setup:
+window.CMDS_NATIVE.onSupabaseTokenRefreshed = (payload) => {
+  // payload: { accessToken, refreshToken, expiresAt, userId }
+  // expiresAt = Unix epoch seconden (kan null zijn)
+  AsyncStorage.setItem('cmds.supabaseAccessToken', payload.accessToken);
+  if (payload.refreshToken) {
+    AsyncStorage.setItem('cmds.supabaseRefreshToken', payload.refreshToken);
+  }
+  if (payload.expiresAt) {
+    AsyncStorage.setItem('cmds.supabaseTokenExpiresAt', String(payload.expiresAt));
+  }
+  // Update ook in-memory cache zodat de POST-loop direct het nieuwe token gebruikt.
+  currentAccessToken = payload.accessToken;
+  tokenInvalid = false;
+};
+Dit is backwards compatible: oude syncSupabaseToken() blijft als fallback werken voor builds zonder deze callback.
+
+Daarnaast: native refresh-token flow als laag-2 vangnet. Als het scherm langer dan 1 uur uit staat, kan de WebView geen onSupabaseTokenRefreshed-event meer pushen omdat hij gepauzeerd is. Voeg toe dat de native shell zélf het refresh token uit AsyncStorage haalt en POST https://txauyjkivyzgxetmadkj.supabase.co/auth/v1/token?grant_type=refresh_token aanroept zodra expiresAt - now() < 120s. Headers: apikey: <SUPABASE_ANON_KEY> + Content-Type: application/json. Body: { "refresh_token": "<token>" }. Response bevat een nieuw access_token + refresh_token + expires_in.
+
+Aanvulling op Fix 3 (POST in watcher-callback)
+Verwijder de losse setInterval(10s) foreground tick volledig. Anders krijg je nog steeds dubbele triggers. De watcher-callback met throttle is voldoende.
+
+Algemene aanvulling — logging tussen elke await
+Voeg in postLocationIfLinked (en de POST-functie zelf) expliciete logregels toe vóór en ná elke await:
+
+[CMDS-GPS] before-fetch ingest-location
+[CMDS-GPS] after-fetch status=200 ms=143
+[CMDS-GPS] before-getCurrentPosition (alleen nog bij cold start)
+[CMDS-GPS] after-getCurrentPosition lat=... ms=...
+Zo zien we in 1 oogopslag in adb logcat waar het hangt mocht er nog iets niet werken.
+
+Algemene aanvulling — whoami-unit cachen
+Roep whoami-unit niet bij elke 10s-tick aan. Cache de uitkomst 60s lokaal. Koppeling verandert zelden en dit spaart 6 requests/minuut per device, wat over alle eenheden samen significant is.

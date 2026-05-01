@@ -70,10 +70,20 @@ export async function fetchLinkedUnitStatus(
 ): Promise<LinkedUnitStatus> {
   const checkedAt = new Date().toISOString();
   try {
-    const response = await fetch(WHOAMI_ENDPOINT, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    console.log("[CMDS-GPS] before-fetch whoami-unit");
+    const ctrl = new AbortController();
+    const abortTimer = setTimeout(() => ctrl.abort(), 15_000);
+    let response: Response;
+    try {
+      response = await fetch(WHOAMI_ENDPOINT, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(abortTimer);
+    }
+    console.log(`[CMDS-GPS] after-fetch whoami-unit status=${response.status}`);
 
     if (response.status === 401) {
       const status: LinkedUnitStatus = {
