@@ -113,6 +113,22 @@ const INJECTED_BRIDGE = `
         }});
       } catch (e) {}
     },
+
+    // Called by the Lovable webapp when the user links to a unit.
+    // payload: { unitId: string, callSign?: string, eventId?: string }
+    onUnitLinked: function(payload) {
+      try {
+        if (!payload || !payload.unitId) return;
+        send({ type: 'unit_linked', unitId: payload.unitId, callSign: payload.callSign || null, eventId: payload.eventId || null });
+      } catch (e) {}
+    },
+
+    // Called by the Lovable webapp when the user unlinks from a unit.
+    onUnitUnlinked: function() {
+      try {
+        send({ type: 'unit_unlinked' });
+      } catch (e) {}
+    },
   };
 
   syncToken();
@@ -389,7 +405,34 @@ export default function Index() {
       const message = JSON.parse(event.nativeEvent.data);
       if (!message || typeof message !== "object") return;
 
-      if (message.type === "start_gps") {
+      if (message.type === "unit_linked") {
+        const unitId =
+          typeof message.unitId === "string" && message.unitId.length > 0
+            ? message.unitId
+            : null;
+        if (!unitId) return;
+        // Idempotent: overschrijf altijd, start GPS alleen als nog niet actief.
+        AsyncStorage.setItem("cmds_active_unit_id", unitId).catch(
+          () => undefined,
+        );
+        if (typeof message.callSign === "string") {
+          AsyncStorage.setItem(
+            "cmds_active_unit_call_sign",
+            message.callSign,
+          ).catch(() => undefined);
+        }
+        console.log(
+          `[CMDS] unit_linked → unitId=${unitId} callSign=${message.callSign ?? "-"} eventId=${message.eventId ?? "-"}`,
+        );
+        startBackgroundLocation().catch(() => undefined);
+      } else if (message.type === "unit_unlinked") {
+        AsyncStorage.multiRemove([
+          "cmds_active_unit_id",
+          "cmds_active_unit_call_sign",
+        ]).catch(() => undefined);
+        console.log("[CMDS] unit_unlinked → GPS gestopt");
+        stopBackgroundLocation().catch(() => undefined);
+      } else if (message.type === "start_gps") {
         startBackgroundLocation().catch(() => undefined);
       } else if (message.type === "stop_gps") {
         stopBackgroundLocation().catch(() => undefined);

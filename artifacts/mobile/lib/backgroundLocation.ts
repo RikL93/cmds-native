@@ -173,15 +173,20 @@ export async function getSupabaseAccessToken(): Promise<string | null> {
   return stored;
 }
 
+export const ACTIVE_UNIT_ID_KEY = "cmds_active_unit_id";
+
 /**
  * Build the exact JSON body that the ingest-location edge function expects.
  * Snake_case as documented by the Lovable backend.
+ * unit_id is included when available so the Edge Function targets the correct
+ * unit regardless of which Supabase account the native shell is logged in as.
  */
 function buildPayload(
   location: Location.LocationObject,
   source: string,
+  unitId: string | null,
 ): Record<string, unknown> {
-  return {
+  const body: Record<string, unknown> = {
     latitude: location.coords.latitude,
     longitude: location.coords.longitude,
     accuracy: location.coords.accuracy,
@@ -192,6 +197,8 @@ function buildPayload(
     recorded_at: new Date(location.timestamp).toISOString(),
     source,
   };
+  if (unitId) body.unit_id = unitId;
+  return body;
 }
 
 /**
@@ -340,7 +347,9 @@ export async function postLocationIfLinked(
     return;
   }
 
-  const payload = buildPayload(location, source);
+  const unitId = await AsyncStorage.getItem(ACTIVE_UNIT_ID_KEY);
+  console.log(`[CMDS-GPS] unit_id=${unitId ?? "-"} (source=${source})`);
+  const payload = buildPayload(location, source, unitId);
   let status = await postLocation(payload, accessToken, source);
 
   // ── Reactieve 401-retry ─────────────────────────────────────────────────
@@ -574,8 +583,9 @@ export async function sendTestPing(): Promise<TestPingResult> {
     }
   }
 
+  const unitId = await AsyncStorage.getItem(ACTIVE_UNIT_ID_KEY);
   await postLocation(
-    buildPayload(coords, "manual-test"),
+    buildPayload(coords, "manual-test", unitId),
     accessToken,
     "manual-test",
   );

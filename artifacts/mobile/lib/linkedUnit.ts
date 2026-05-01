@@ -65,17 +65,27 @@ export async function clearLinkedUnitCache(): Promise<void> {
   await AsyncStorage.removeItem(STATUS_STORAGE_KEY);
 }
 
+const ACTIVE_UNIT_ID_KEY = "cmds_active_unit_id";
+
 export async function fetchLinkedUnitStatus(
   token: string,
 ): Promise<LinkedUnitStatus> {
   const checkedAt = new Date().toISOString();
   try {
-    console.log("[CMDS-GPS] before-fetch whoami-unit");
+    // Stuur unit_id als query-parameter mee zodat de Edge Function de juiste
+    // eenheid pakt, ook als de native shell als een ander account is ingelogd.
+    const unitId = await AsyncStorage.getItem(ACTIVE_UNIT_ID_KEY);
+    const url = unitId
+      ? `${WHOAMI_ENDPOINT}?unit_id=${encodeURIComponent(unitId)}`
+      : WHOAMI_ENDPOINT;
+    console.log(
+      `[CMDS-GPS] before-fetch whoami-unit unit_id=${unitId ?? "-"}`,
+    );
     const ctrl = new AbortController();
     const abortTimer = setTimeout(() => ctrl.abort(), 15_000);
     let response: Response;
     try {
-      response = await fetch(WHOAMI_ENDPOINT, {
+      response = await fetch(url, {
         method: "GET",
         headers: { Authorization: `Bearer ${token}` },
         signal: ctrl.signal,
