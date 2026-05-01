@@ -36,7 +36,10 @@ import {
   updateLastKnownLocation,
   type Diagnostics,
 } from "@/lib/backgroundLocation";
-import { fetchLinkedUnitStatus } from "@/lib/linkedUnit";
+import {
+  fetchLinkedUnitStatus,
+  invalidateLinkedUnitCache,
+} from "@/lib/linkedUnit";
 
 const BATTERY_PROMPT_FLAG_KEY = "cmds.askedBatteryOptimization";
 
@@ -421,6 +424,9 @@ export default function Index() {
             message.callSign,
           ).catch(() => undefined);
         }
+        // Cache legen zodat de eerstvolgende whoami-unit direct een verse
+        // linked:true terugkrijgt i.p.v. de oude linked:false te hergebruiken.
+        invalidateLinkedUnitCache();
         console.log(
           `[CMDS] unit_linked → unitId=${unitId} callSign=${message.callSign ?? "-"} eventId=${message.eventId ?? "-"}`,
         );
