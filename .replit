@@ -9,27 +9,6 @@ args = ["pnpm", "store", "prune"]
 env = { "CI" = "true" }
 
 [workflows]
-runButton = "Project"
-
-[[workflows.workflow]]
-name = "Project"
-mode = "parallel"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "Push naar GitHub"
-
-[[workflows.workflow]]
-name = "Push naar GitHub"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "sh push.sh; echo 'PUSH KLAAR — sluit deze workflow'"
-
-[workflows.workflow.metadata]
-outputType = "console"
 
 [agent]
 stack = "PNPM_WORKSPACE"
