@@ -6,6 +6,7 @@ import { Platform } from "react-native";
 import {
   fetchLinkedUnitStatus,
   getOrRefreshLinkedUnitStatus,
+  invalidateLinkedUnitCache,
   type LinkedUnitStatus,
 } from "./linkedUnit";
 
@@ -65,6 +66,22 @@ const DEFAULT_DIAGNOSTICS: Diagnostics = {
   lastLinkedCallSign: null,
   lastLinkedError: null,
 };
+
+// ---------------------------------------------------------------------------
+// FIX 1: Module-level last-known-location cache.
+// The watchPositionAsync watcher in app/index.tsx calls updateLastKnownLocation
+// on every fix. postForegroundLocation() reads from here instead of calling
+// getCurrentPositionAsync(), which can hang for 30-60s without a satellite fix.
+// ---------------------------------------------------------------------------
+let _lastKnownLocation: Location.LocationObject | null = null;
+
+export function updateLastKnownLocation(loc: Location.LocationObject): void {
+  _lastKnownLocation = loc;
+}
+
+export function getLastKnownLocation(): Location.LocationObject | null {
+  return _lastKnownLocation;
+}
 
 export async function getDiagnostics(): Promise<Diagnostics> {
   try {
@@ -152,18 +169,20 @@ function buildPayload(
   };
 }
 
+/**
+ * Low-level POST. Returns the HTTP status (or null on network error).
+ */
 async function postLocation(
   payload: Record<string, unknown>,
   accessToken: string,
   source: string,
-): Promise<void> {
+): Promise<number | null> {
   const startedAt = Date.now();
   console.log("POST ingest-location", {
     url: LOCATION_ENDPOINT,
     hasToken: !!accessToken,
     tokenLength: accessToken?.length ?? 0,
     source,
-    payloadKeys: Object.keys(payload),
     lat: payload.latitude,
     lng: payload.longitude,
   });
@@ -200,17 +219,18 @@ async function postLocation(
       await patchDiagnostics({
         lastPostAt: new Date().toISOString(),
         lastPostStatus: response.status,
-        lastPostError: `HTTP ${response.status}`,
+        lastPostError: `HTTP ${response.status}: ${bodyText.slice(0, 120)}`,
         lastPostBody: bodyText.slice(0, 500),
         lastPostSource: source,
         postFailureCount: current.postFailureCount + 1,
       });
     }
+    return response.status;
   } catch (e) {
     const took = Date.now() - startedAt;
     const errMsg = e instanceof Error ? e.message : String(e);
     console.log(
-      `[CMDS-GPS] POST /ingest-location → ERROR ${errMsg}, took=${took}ms (source=${source})`,
+      `[CMDS-GPS] POST /ingest-location → NETWORK ERROR ${errMsg}, took=${took}ms (source=${source})`,
     );
     const current = await getDiagnostics();
     await patchDiagnostics({
@@ -221,6 +241,7 @@ async function postLocation(
       lastPostSource: source,
       postFailureCount: current.postFailureCount + 1,
     });
+    return null;
   }
 }
 
@@ -235,9 +256,13 @@ async function recordSkip(reason: string, source: string): Promise<void> {
 }
 
 /**
- * Posts a single location fix via /ingest-location, but only after passing
- * the linked-unit gate. Used by both the background TaskManager and the
- * foreground 10s loop.
+ * Posts a single location fix via /ingest-location after passing the
+ * linked-unit gate.
+ *
+ * FIX 2: 401 retry with fresh token.
+ * If the edge function returns 401 (token expired), we immediately re-read
+ * the token from AsyncStorage — the website's autoRefreshToken may have
+ * updated it already — and retry once with the new token.
  */
 export async function postLocationIfLinked(
   location: Location.LocationObject,
@@ -245,7 +270,7 @@ export async function postLocationIfLinked(
   linkedTtlMs: number,
 ): Promise<void> {
   console.log(`[CMDS-GPS] postLocationIfLinked called (source=${source})`);
-  const accessToken = await getSupabaseAccessToken();
+  let accessToken = await getSupabaseAccessToken();
   if (!accessToken) {
     console.log("POST ingest-location SKIP: no token", { source });
     await recordSkip("geen token — log in op de website", source);
@@ -270,7 +295,26 @@ export async function postLocationIfLinked(
     return;
   }
 
-  await postLocation(buildPayload(location, source), accessToken, source);
+  const payload = buildPayload(location, source);
+  let status = await postLocation(payload, accessToken, source);
+
+  // 401 retry: the access token may have been refreshed by the website in
+  // the WebView while the background task was sleeping. Re-read and retry once.
+  if (status === 401) {
+    console.log(
+      "[CMDS-GPS] 401 received — re-reading token from storage and retrying",
+    );
+    const freshToken = await getSupabaseAccessToken();
+    if (freshToken && freshToken !== accessToken) {
+      accessToken = freshToken;
+      // Invalidate linked cache so the next check uses the new token.
+      invalidateLinkedUnitCache();
+      status = await postLocation(payload, accessToken, source);
+      console.log(`[CMDS-GPS] retry after token refresh → status=${status}`);
+    } else {
+      console.log("[CMDS-GPS] retry skipped — no newer token in storage");
+    }
+  }
 }
 
 if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
@@ -296,6 +340,9 @@ if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
 
     const lastLocation = locations[locations.length - 1];
     if (lastLocation) {
+      // Update the shared cache so the foreground POST loop always has a
+      // fresh location even when watchPositionAsync hasn't fired yet.
+      updateLastKnownLocation(lastLocation);
       await patchDiagnostics({
         lastBackgroundFixAt: new Date(lastLocation.timestamp).toISOString(),
         lastBackgroundLat: lastLocation.coords.latitude,
@@ -354,26 +401,33 @@ export async function isBackgroundLocationActive(): Promise<boolean> {
 }
 
 /**
- * Posts the current foreground location via /ingest-location with
- * source="expo-fg". Called from the foreground 10s loop in the UI.
- * TTL is short so a freshly-linked unit becomes visible immediately.
+ * FIX 3: Uses _lastKnownLocation from the watcher instead of calling
+ * getCurrentPositionAsync(), which can hang indefinitely with High accuracy
+ * when GPS satellite signal is weak (indoors, basement, cold start).
+ *
+ * Called from the foreground 10s interval in app/index.tsx.
  */
 export async function postForegroundLocation(): Promise<void> {
   if (Platform.OS === "web") return;
-  let coords: Location.LocationObject;
-  try {
-    coords = await Location.getCurrentPositionAsync({
-      accuracy: Location.Accuracy.High,
-    });
-  } catch (e) {
-    console.log(`[CMDS-GPS] foreground getCurrentPosition error: ${e}`);
+
+  const location = _lastKnownLocation;
+  if (!location) {
+    console.log(
+      "[CMDS-GPS] postForegroundLocation: no cached location yet — skipping",
+    );
     return;
   }
-  await postLocationIfLinked(
-    coords,
-    "expo-fg",
-    FOREGROUND_LINKED_CHECK_TTL_MS,
-  );
+
+  // Only post if the fix is reasonably fresh (less than 60s old).
+  const ageMs = Date.now() - location.timestamp;
+  if (ageMs > 60_000) {
+    console.log(
+      `[CMDS-GPS] postForegroundLocation: cached location is ${Math.round(ageMs / 1000)}s old — skipping`,
+    );
+    return;
+  }
+
+  await postLocationIfLinked(location, "expo-fg", FOREGROUND_LINKED_CHECK_TTL_MS);
 }
 
 export type TestPingResult = {
@@ -412,8 +466,6 @@ export async function sendTestPing(): Promise<TestPingResult> {
     };
   }
 
-  // Always force-refresh the linked status during a manual test so the user
-  // sees the live answer, not a cached one.
   const linkedStatus = await fetchLinkedUnitStatus(accessToken);
   await patchDiagnostics(diagnosticsPatchFromLinkedStatus(linkedStatus));
 
@@ -442,21 +494,24 @@ export async function sendTestPing(): Promise<TestPingResult> {
     };
   }
 
-  let coords: Location.LocationObject;
-  try {
-    coords = await Location.getCurrentPositionAsync({
-      accuracy: Location.Accuracy.High,
-    });
-  } catch (e) {
-    return {
-      ok: false,
-      status: null,
-      body: "",
-      error: e instanceof Error ? e.message : String(e),
-      skipped: false,
-      skipReason: null,
-      linkedCallSign: linkedStatus.unit?.call_sign ?? null,
-    };
+  // For manual test, prefer cached location; fall back to fresh GPS fix.
+  let coords = _lastKnownLocation;
+  if (!coords) {
+    try {
+      coords = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+    } catch (e) {
+      return {
+        ok: false,
+        status: null,
+        body: "",
+        error: e instanceof Error ? e.message : String(e),
+        skipped: false,
+        skipReason: null,
+        linkedCallSign: linkedStatus.unit?.call_sign ?? null,
+      };
+    }
   }
 
   await postLocation(

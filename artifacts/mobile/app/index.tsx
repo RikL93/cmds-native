@@ -32,6 +32,7 @@ import {
   setSupabaseAccessToken,
   startBackgroundLocation,
   stopBackgroundLocation,
+  updateLastKnownLocation,
   type Diagnostics,
 } from "@/lib/backgroundLocation";
 import { fetchLinkedUnitStatus } from "@/lib/linkedUnit";
@@ -343,6 +344,9 @@ export default function Index() {
           },
           (location) => {
             if (cancelled) return;
+            // FIX 1: update shared cache so the POST loop uses this fix
+            // directly instead of calling getCurrentPositionAsync().
+            updateLastKnownLocation(location);
             const coords = {
               latitude: location.coords.latitude,
               longitude: location.coords.longitude,

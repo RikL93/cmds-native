@@ -30,6 +30,18 @@ const EMPTY_STATUS: LinkedUnitStatus = {
   error: null,
 };
 
+// In-memory flag: set by invalidateLinkedUnitCache() to force a fresh fetch
+// on the next getOrRefreshLinkedUnitStatus() call regardless of TTL.
+let _forceNextRefresh = false;
+
+/**
+ * Forces the next getOrRefreshLinkedUnitStatus() call to bypass the cache and
+ * hit the server. Used after a 401 retry to ensure the new token is validated.
+ */
+export function invalidateLinkedUnitCache(): void {
+  _forceNextRefresh = true;
+}
+
 export async function getCachedLinkedUnitStatus(): Promise<LinkedUnitStatus | null> {
   try {
     const raw = await AsyncStorage.getItem(STATUS_STORAGE_KEY);
@@ -129,12 +141,15 @@ export async function getOrRefreshLinkedUnitStatus(
   token: string,
   maxAgeMs: number,
 ): Promise<LinkedUnitStatus> {
-  const cached = await getCachedLinkedUnitStatus();
-  if (cached && cached.checkedAt) {
-    const age = Date.now() - new Date(cached.checkedAt).getTime();
-    if (age >= 0 && age < maxAgeMs && !cached.tokenInvalid) {
-      return cached;
+  if (!_forceNextRefresh) {
+    const cached = await getCachedLinkedUnitStatus();
+    if (cached && cached.checkedAt) {
+      const age = Date.now() - new Date(cached.checkedAt).getTime();
+      if (age >= 0 && age < maxAgeMs && !cached.tokenInvalid) {
+        return cached;
+      }
     }
   }
+  _forceNextRefresh = false;
   return fetchLinkedUnitStatus(token);
 }
