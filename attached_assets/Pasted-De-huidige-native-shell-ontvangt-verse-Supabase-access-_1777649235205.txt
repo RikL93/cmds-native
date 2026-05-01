@@ -1,0 +1,114 @@
+De huidige native shell ontvangt verse Supabase access tokens via twee paden:
+1. AsyncStorage polling (setInterval syncToken, elke 5s)
+2. Push vanuit de webapp via window.CMDS_NATIVE.onSupabaseTokenRefreshed
+   (wordt door de Lovable webapp aangeroepen op TOKEN_REFRESHED / SIGNED_IN)
+
+Beide paden werken alleen zolang de WebView leeft en JavaScript draait.
+Scenario dat nog niet is afgedekt: de gebruiker laat het apparaat lang
+inactief (>1 uur), de OS pauzeert de WebView volledig, het Supabase
+access_token verloopt (1u TTL), de native achtergrond-GPS-loop blijft
+draaien maar krijgt 401's en kan niet zelf refreshen.
+
+De 401-retry die er nu in zit (lib/backgroundLocation.ts r327-331) lost
+dit niet op, want hij leest alleen het verlopen token opnieuw uit
+AsyncStorage. Er is een echte refresh nodig.
+
+Doel
+====
+Implementeer in de native shell een fallback refresh-flow die rechtstreeks
+het Supabase auth-endpoint aanroept met grant_type=refresh_token, zodat
+de background-GPS-loop ook na lange WebView-pauzes blijft werken zonder
+op de webapp te wachten.
+
+Endpoint
+========
+POST https://txauyjkivyzgxetmadkj.supabase.co/auth/v1/token?grant_type=refresh_token
+
+Headers:
+  apikey: <SUPABASE_ANON_KEY uit env / hardcoded zoals nu de URL>
+  Content-Type: application/json
+  Authorization: Bearer <SUPABASE_ANON_KEY>
+
+Body:
+  { "refresh_token": "<refresh_token uit AsyncStorage>" }
+
+Response (200):
+  {
+    "access_token": "...",      // nieuw JWT, ~1u TTL
+    "refresh_token": "...",     // ROULEERT — vervang oude in storage
+    "expires_in": 3600,
+    "expires_at": 1735689600,   // unix epoch seconds
+    "token_type": "bearer",
+    "user": { "id": "...", ... }
+  }
+
+Response (400/401):
+  refresh_token is ongeldig of ingetrokken → user moet opnieuw inloggen
+  via de webapp. Geen retry-loop, gewoon token leegmaken en stoppen.
+
+Implementatie
+=============
+1. Nieuwe helper in lib/ (bv. lib/supabaseRefresh.ts):
+
+   export async function refreshSupabaseTokenNative(): Promise<{
+     accessToken: string;
+     refreshToken: string;
+     expiresAt: number;
+     userId: string;
+   } | null>
+
+   - Leest "cmds.supabaseRefreshToken" uit AsyncStorage
+   - Als leeg → return null
+   - Roept het endpoint hierboven aan met AbortController (10s timeout)
+   - Logt "[CMDS-GPS] before-fetch refresh-token"
+            "[CMDS-GPS] after-fetch refresh-token status=<n> ms=<n>"
+   - Bij 200:
+       * AsyncStorage.setItem("cmds.supabaseAccessToken", access_token)
+       * AsyncStorage.setItem("cmds.supabaseRefreshToken", refresh_token)
+       * AsyncStorage.setItem("cmds.supabaseTokenExpiresAt", String(expires_at))
+       * Werk in-memory cache bij via updateAccessToken(access_token)
+         (dezelfde functie die token_refreshed-handler in app/index.tsx
+         al gebruikt)
+       * Return de payload
+   - Bij 4xx: log "[CMDS-GPS] refresh-token rejected — clearing tokens",
+       wis alle drie de keys uit AsyncStorage, return null
+   - Bij netwerkfout / timeout: log "[CMDS-GPS] refresh-token network
+       error", return null (volgende tick probeert het opnieuw)
+
+2. Pro-active refresh in de POST-loop (lib/backgroundLocation.ts):
+
+   Vóór elke postLocation():
+   - Lees expiresAt uit AsyncStorage (cache 60s om reads te beperken)
+   - Als expiresAt - now < 120 seconden → roep refreshSupabaseTokenNative()
+     aan vóór de POST. Slaagt het, gebruik nieuwe token. Faalt het, val
+     terug op het bestaande token (POST geeft dan 401 → 401-retry pad).
+
+3. Reactieve refresh in 401-retry-pad:
+
+   In de bestaande 401-retry (lib/backgroundLocation.ts r327-331):
+   - Vervang "alleen token herlezen uit storage" door:
+       a. eerst refreshSupabaseTokenNative() proberen
+       b. als die een nieuw token oplevert → retry POST met dat token
+       c. als die null teruggeeft → val terug op de huidige logica
+          (storage herlezen + 1x retry); bij opnieuw 401 stoppen en
+          loggen "[CMDS-GPS] AUTH FAILED — refresh exhausted"
+
+4. Geen aparte timer voor refresh nodig. Punt 2 dekt pro-actief, punt 3
+   dekt reactief. Eén bron van timing = de bestaande 10s POST-tick.
+
+5. Belangrijk: laat de bestaande syncToken-polling (setInterval 5s in
+   app/index.tsx r119) en de onSupabaseTokenRefreshed-handler intact.
+   Die blijven het primaire pad zolang de WebView leeft. De native
+   refresh is puur fallback voor het pause-scenario.
+
+Acceptatiecriteria
+==================
+- Apparaat 2 uur in standby met scherm uit en webapp open. Bij ontwaken
+  zien we in de logs minimaal één regel "before-fetch refresh-token"
+  gevolgd door "after-fetch refresh-token status=200" en POST's blijven
+  doorkomen op de Supabase ingest-location functie.
+- Bij ingetrokken refresh_token (handmatig leeggemaakt in AsyncStorage)
+  zien we "refresh-token rejected — clearing tokens" en stopt de loop
+  netjes met "AUTH FAILED — refresh exhausted" zonder retry-storm.
+- Geen wijziging aan de Lovable webapp of edge functions nodig — alle
+  endpoints en payload-formaten blijven gelijk.

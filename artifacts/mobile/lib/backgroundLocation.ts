@@ -9,28 +9,28 @@ import {
   invalidateLinkedUnitCache,
   type LinkedUnitStatus,
 } from "./linkedUnit";
+import {
+  ACCESS_TOKEN_KEY,
+  getCachedAccessToken,
+  getTokenExpiresAt,
+  invalidateExpiresAtCache,
+  refreshSupabaseTokenNative,
+  updateAccessToken as _updateAccessToken,
+} from "./supabaseRefresh";
+
+// Re-export updateAccessToken so app/index.tsx can keep importing it from here.
+export { updateAccessToken } from "./supabaseRefresh";
 
 export const LOCATION_TASK_NAME = "cmds-background-location-task";
 export const LOCATION_ENDPOINT =
   "https://txauyjkivyzgxetmadkj.supabase.co/functions/v1/ingest-location";
 
-export const SUPABASE_TOKEN_STORAGE_KEY = "cmds.supabase.access_token";
+// Keep the old export name for any external references.
+export { ACCESS_TOKEN_KEY as SUPABASE_TOKEN_STORAGE_KEY } from "./supabaseRefresh";
 export const DIAGNOSTICS_STORAGE_KEY = "cmds.diagnostics";
 
 const BACKGROUND_LINKED_CHECK_TTL_MS = 30_000;
 const FOREGROUND_LINKED_CHECK_TTL_MS = 60_000; // cache whoami 60s — saves ~6 req/min/device
-
-// ---------------------------------------------------------------------------
-// In-memory access-token cache.
-// Updated immediately by updateAccessToken() (called from the bridge event
-// handler in app/index.tsx when the webapp fires onSupabaseTokenRefreshed).
-// Avoids an AsyncStorage round-trip on every POST tick.
-// ---------------------------------------------------------------------------
-let _currentAccessToken: string | null = null;
-
-export function updateAccessToken(token: string | null): void {
-  _currentAccessToken = token;
-}
 
 type BackgroundTaskBody = {
   data?: { locations?: Location.LocationObject[] };
@@ -150,24 +150,26 @@ export function diagnosticsPatchFromLinkedStatus(
 export async function setSupabaseAccessToken(
   token: string | null,
 ): Promise<void> {
-  _currentAccessToken = token; // keep in-memory cache in sync
+  _updateAccessToken(token); // keeps in-memory cache in sync immediately
   if (token && token.length > 0) {
-    await AsyncStorage.setItem(SUPABASE_TOKEN_STORAGE_KEY, token);
+    await AsyncStorage.setItem(ACCESS_TOKEN_KEY, token);
     await patchDiagnostics({
       lastTokenSeenAt: new Date().toISOString(),
       lastTokenLength: token.length,
     });
   } else {
-    await AsyncStorage.removeItem(SUPABASE_TOKEN_STORAGE_KEY);
+    await AsyncStorage.removeItem(ACCESS_TOKEN_KEY);
     await patchDiagnostics({ lastTokenLength: 0 });
   }
 }
 
 export async function getSupabaseAccessToken(): Promise<string | null> {
-  // Prefer in-memory cache (updated synchronously by bridge events).
-  if (_currentAccessToken !== null) return _currentAccessToken;
-  const stored = await AsyncStorage.getItem(SUPABASE_TOKEN_STORAGE_KEY);
-  _currentAccessToken = stored; // prime cache on cold start
+  // Prefer in-memory cache (updated synchronously by bridge events and native refresh).
+  const cached = getCachedAccessToken();
+  if (cached !== null) return cached;
+  // Cold start: prime the cache from AsyncStorage.
+  const stored = await AsyncStorage.getItem(ACCESS_TOKEN_KEY);
+  _updateAccessToken(stored);
   return stored;
 }
 
@@ -303,6 +305,23 @@ export async function postLocationIfLinked(
     return;
   }
 
+  // ── Proactieve refresh ──────────────────────────────────────────────────
+  // Als het token binnen 120s verloopt, refresh het NU — vóór de POST — zodat
+  // de GPS-loop blijft werken ook al is de WebView al >1 uur gepauzeerd.
+  const expiresAt = await getTokenExpiresAt();
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (expiresAt !== null && expiresAt - nowSec < 120) {
+    console.log(
+      `[CMDS-GPS] token verloopt over ${expiresAt - nowSec}s — proactieve refresh`,
+    );
+    const refreshed = await refreshSupabaseTokenNative();
+    if (refreshed) {
+      accessToken = refreshed.accessToken;
+      invalidateLinkedUnitCache(); // whoami opnieuw checken met nieuw token
+      invalidateExpiresAtCache();
+    }
+  }
+
   const linkedStatus = await getOrRefreshLinkedUnitStatus(
     accessToken,
     linkedTtlMs,
@@ -324,21 +343,43 @@ export async function postLocationIfLinked(
   const payload = buildPayload(location, source);
   let status = await postLocation(payload, accessToken, source);
 
-  // 401 retry: the access token may have been refreshed by the website in
-  // the WebView while the background task was sleeping. Re-read and retry once.
+  // ── Reactieve 401-retry ─────────────────────────────────────────────────
+  // Volgorde: 1) native refresh proberen, 2) fallback op storage re-read.
   if (status === 401) {
     console.log(
-      "[CMDS-GPS] 401 received — re-reading token from storage and retrying",
+      "[CMDS-GPS] 401 ontvangen — native token refresh proberen",
     );
-    const freshToken = await getSupabaseAccessToken();
-    if (freshToken && freshToken !== accessToken) {
-      accessToken = freshToken;
-      // Invalidate linked cache so the next check uses the new token.
+
+    // Stap a: probeer te refreshen via het Supabase auth-endpoint.
+    const refreshed = await refreshSupabaseTokenNative();
+    if (refreshed) {
+      accessToken = refreshed.accessToken;
       invalidateLinkedUnitCache();
       status = await postLocation(payload, accessToken, source);
-      console.log(`[CMDS-GPS] retry after token refresh → status=${status}`);
+      console.log(
+        `[CMDS-GPS] retry na native refresh → status=${status}`,
+      );
     } else {
-      console.log("[CMDS-GPS] retry skipped — no newer token in storage");
+      // Stap b: fallback — misschien heeft de WebView het token al ververst
+      // in AsyncStorage terwijl de native refresh faalde (bv. offline).
+      const storedToken = await AsyncStorage.getItem(ACCESS_TOKEN_KEY);
+      if (storedToken && storedToken !== accessToken) {
+        accessToken = storedToken;
+        _updateAccessToken(storedToken);
+        invalidateLinkedUnitCache();
+        status = await postLocation(payload, accessToken, source);
+        console.log(
+          `[CMDS-GPS] retry na storage re-read → status=${status}`,
+        );
+      } else {
+        console.log(
+          "[CMDS-GPS] retry overgeslagen — geen nieuwer token beschikbaar",
+        );
+      }
+    }
+
+    if (status === 401) {
+      console.log("[CMDS-GPS] AUTH FAILED — refresh exhausted");
     }
   }
 }
