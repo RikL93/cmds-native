@@ -313,8 +313,6 @@ export async function postLocationIfLinked(
   }
 
   // ── Proactieve refresh ──────────────────────────────────────────────────
-  // Als het token binnen 120s verloopt, refresh het NU — vóór de POST — zodat
-  // de GPS-loop blijft werken ook al is de WebView al >1 uur gepauzeerd.
   const expiresAt = await getTokenExpiresAt();
   const nowSec = Math.floor(Date.now() / 1000);
   if (expiresAt !== null && expiresAt - nowSec < 120) {
@@ -324,11 +322,48 @@ export async function postLocationIfLinked(
     const refreshed = await refreshSupabaseTokenNative();
     if (refreshed) {
       accessToken = refreshed.accessToken;
-      invalidateLinkedUnitCache(); // whoami opnieuw checken met nieuw token
+      invalidateLinkedUnitCache();
       invalidateExpiresAtCache();
     }
   }
 
+  // ── Bridge unit_id pad ───────────────────────────────────────────────────
+  // Als de WebView via onUnitLinked een unit_id heeft doorgegeven, vertrouwen
+  // we dat volledig en slaan whoami-unit over. De Edge Function valideert de
+  // combinatie van token + unit_id zelf. Dit lost het account-mismatch probleem
+  // op waarbij de native shell als een ander account ingelogd is dan de WebView.
+  const unitId = await AsyncStorage.getItem(ACTIVE_UNIT_ID_KEY);
+  if (unitId) {
+    console.log(
+      `[CMDS-GPS] bridge unit_id=${unitId} — whoami-unit overgeslagen, direct POST`,
+    );
+    const payload = buildPayload(location, source, unitId);
+    let status = await postLocation(payload, accessToken, source);
+
+    if (status === 401) {
+      console.log("[CMDS-GPS] 401 — native token refresh proberen (bridge pad)");
+      const refreshed = await refreshSupabaseTokenNative();
+      if (refreshed) {
+        accessToken = refreshed.accessToken;
+        status = await postLocation(payload, accessToken, source);
+        console.log(`[CMDS-GPS] retry na native refresh → status=${status}`);
+      } else {
+        const storedToken = await AsyncStorage.getItem(ACCESS_TOKEN_KEY);
+        if (storedToken && storedToken !== accessToken) {
+          accessToken = storedToken;
+          _updateAccessToken(storedToken);
+          status = await postLocation(payload, accessToken, source);
+          console.log(`[CMDS-GPS] retry na storage re-read → status=${status}`);
+        }
+      }
+      if (status === 401) {
+        console.log("[CMDS-GPS] AUTH FAILED — refresh exhausted (bridge pad)");
+      }
+    }
+    return;
+  }
+
+  // ── Fallback: whoami-unit pad (geen bridge unit_id) ──────────────────────
   const linkedStatus = await getOrRefreshLinkedUnitStatus(
     accessToken,
     linkedTtlMs,
@@ -347,9 +382,8 @@ export async function postLocationIfLinked(
     return;
   }
 
-  const unitId = await AsyncStorage.getItem(ACTIVE_UNIT_ID_KEY);
-  console.log(`[CMDS-GPS] unit_id=${unitId ?? "-"} (source=${source})`);
-  const payload = buildPayload(location, source, unitId);
+  console.log(`[CMDS-GPS] whoami unit_id=${linkedStatus.unit?.id ?? "-"} (source=${source})`);
+  const payload = buildPayload(location, source, linkedStatus.unit?.id ?? null);
   let status = await postLocation(payload, accessToken, source);
 
   // ── Reactieve 401-retry ─────────────────────────────────────────────────

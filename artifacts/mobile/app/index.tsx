@@ -205,14 +205,20 @@ export default function Index() {
   const [testRunning, setTestRunning] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
   const [appActive, setAppActive] = useState(true);
+  const [bridgeUnitId, setBridgeUnitId] = useState<string | null>(null);
+  const [bridgeCallSign, setBridgeCallSign] = useState<string | null>(null);
 
   const refreshDiagnostics = useCallback(async () => {
-    const [d, active] = await Promise.all([
+    const [d, active, uid, cs] = await Promise.all([
       getDiagnostics(),
       isBackgroundLocationActive(),
+      AsyncStorage.getItem("cmds_active_unit_id"),
+      AsyncStorage.getItem("cmds_active_unit_call_sign"),
     ]);
     setDiagnostics(d);
     setServiceActive(active);
+    setBridgeUnitId(uid);
+    setBridgeCallSign(cs);
   }, []);
 
   useEffect(() => {
@@ -711,7 +717,16 @@ export default function Index() {
               value={formatTimeAgo(diagnostics?.lastTokenSeenAt ?? null)}
             />
             <DiagRow
-              label="Eenheid gekoppeld"
+              label="Bridge eenheid (app)"
+              value={
+                bridgeUnitId
+                  ? `${bridgeCallSign ?? "?"} — ${bridgeUnitId.slice(0, 8)}…`
+                  : "Niet ingesteld — open CMDS en kies een eenheid"
+              }
+              good={!!bridgeUnitId}
+            />
+            <DiagRow
+              label="Eenheid gekoppeld (server)"
               value={linkedLabel.text}
               good={linkedLabel.good}
             />
