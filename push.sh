@@ -17,8 +17,12 @@ fi
 REMOTE="https://oauth2:${GITHUB_TOKEN}@github.com/RikL93/cmds-native.git"
 REPO_URL="https://github.com/RikL93/cmds-native.git"
 
-git remote remove github 2>/dev/null || true
-git remote add github "$REMOTE"
+# Zet of update de github remote (robuuster dan remove+add)
+if git remote get-url github >/dev/null 2>&1; then
+  git remote set-url github "$REMOTE"
+else
+  git remote add github "$REMOTE"
+fi
 
 # Stel git-identiteit in (vereist voor commit-tree)
 git config user.email "replit-agent@cmds.nl" 2>/dev/null || true

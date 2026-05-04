@@ -6,6 +6,9 @@
     "paths": {
       "@/*": [
         "./*"
+      ],
+      "cmds-location": [
+        "./modules/cmds-location/index"
       ]
     }
   },

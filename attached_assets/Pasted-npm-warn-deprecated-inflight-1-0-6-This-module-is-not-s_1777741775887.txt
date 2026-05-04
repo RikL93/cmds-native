@@ -1,0 +1,37 @@
+npm warn deprecated inflight@1.0.6: This module is not supported, and leaks memory. Do not use it. Check out lru-cache if you want a good and tested way to coalesce async requests by a key value, which is much more comprehensive and powerful.
+npm warn deprecated lodash.get@4.4.2: This package is deprecated. Use the optional chaining (?.) operator instead.
+npm warn deprecated @xmldom/xmldom@0.7.13: this version has critical issues, please update to the latest version
+npm warn deprecated rimraf@2.4.5: Rimraf versions prior to v4 are no longer supported
+npm warn deprecated glob@6.0.4: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+npm warn deprecated uuid@7.0.3: uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).
+npm warn deprecated uuid@9.0.1: uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).
+npm warn deprecated uuid@8.3.2: uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).
+npm warn deprecated uuid@8.3.2: uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).
+npm warn deprecated glob@10.5.0: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+npm warn deprecated glob@10.5.0: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+npm warn deprecated glob@10.5.0: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+npm warn deprecated tar@7.5.7: Old versions of tar are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+Unable to resolve a valid config plugin for ./modules/cmds-location/plugin.
+• No "app.plugin.js" file found in ./modules/cmds-location/plugin: config plugins are typically exported from an "app.plugin.js" file in the package root.
+• main export of ./modules/cmds-location/plugin does not appear to be a config plugin: the following error was thrown when importing /home/runner/workspace/artifacts/mobile/modules/cmds-location/plugin.js: Cannot find module '@expo/config-plugins'
+Require stack:
+- /home/runner/workspace/artifacts/mobile/modules/cmds-location/plugin.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@expo/config-plugins/build/utils/plugin-resolver.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@expo/config-plugins/build/plugins/withStaticPlugin.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@expo/config-plugins/build/plugins/withPlugins.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@expo/config-plugins/build/index.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/eas-cli/build/build/android/syncProjectConfiguration.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/eas-cli/build/build/android/build.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/eas-cli/build/build/runBuildAndSubmit.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/eas-cli/build/commands/build/index.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@oclif/core/lib/module-loader.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@oclif/core/lib/help/index.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@oclif/core/lib/errors/handle.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@oclif/core/lib/errors/index.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@oclif/core/lib/config/config.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@oclif/core/lib/config/index.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@oclif/core/lib/command.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/@oclif/core/lib/index.js
+- /home/runner/.npm/_npx/6bc7bae5c2059953/node_modules/eas-cli/bin/run MODULE_NOT_FOUND
+Verify that ./modules/cmds-location/plugin includes a config plugin. If it does not, then remove the entry from plugins in your app config file. Learn more: https://docs.expo.dev/guides/config-plugins/
+    Error: build command failed.
