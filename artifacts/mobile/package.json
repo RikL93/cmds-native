@@ -13,6 +13,7 @@
     "@babel/core": "^7.25.2",
     "@expo-google-fonts/inter": "^0.4.0",
     "@expo/cli": "54.0.23",
+    "@expo/config-plugins": "54.0.4",
     "@expo/ngrok": "^4.1.0",
     "@expo/vector-icons": "^15.0.3",
     "@react-native-async-storage/async-storage": "2.2.0",
@@ -56,6 +57,7 @@
     "zod-validation-error": "^3.4.0"
   },
   "dependencies": {
+    "cmds-location": "file:./modules/cmds-location",
     "expo-build-properties": "^1.0.10",
     "expo-intent-launcher": "^55.0.12",
     "expo-task-manager": "^14.0.9",

@@ -1,0 +1,107 @@
+Replit-prompt — Verifieer & log de native ingest-pipeline
+Context vanuit Lovable-analyse (2 mei 2026, 05:36 UTC):
+
+BRAVO 1 (unit_id = ddb85933-ea2f-46f4-8119-16838e761abc) heeft linked_device_id correct gezet en last_activity_at updatet om de 10s — dat zijn webview foreground POSTs.
+In de Supabase edge function logs van ingest-location staan 0 (nul) requests vanuit de native shell. Niet 401, niet 400, helemaal niets.
+Conclusie: de native shell doet feitelijk geen HTTP POST naar https://txauyjkivyzgxetmadkj.supabase.co/functions/v1/ingest-location. Het probleem ligt dus niet in unit_id-koppeling of autorisatie, maar in de uitgaande HTTP-call zelf (URL fout, geen token, background service crasht, of POST gaat nog steeds naar legacy cmdsevent.nl/api/location).
+DEEL 1 — Verifieer in code
+Bevestig elk punt met ✅/❌ + bestand+regelnummer:
+
+POST URL is exact:
+
+https://txauyjkivyzgxetmadkj.supabase.co/functions/v1/ingest-location
+Geen /api/location, geen cmdsevent.nl, geen self-hosted endpoint.
+
+Headers bij elke POST:
+
+Authorization: Bearer <accessToken> — token uit AsyncStorage key sb-txauyjkivyzgxetmadkj-auth-token (JSON parse → .access_token)
+Content-Type: application/json
+apikey: <anon key> (publieke anon key uit Lovable)
+Body bevat:
+
+
+{
+  "latitude": 52.x,
+  "longitude": 4.x,
+  "accuracy": 10,
+  "timestamp": 1714632000000,   // number (ms) OF ISO string — beide ok sinds laatste deploy
+  "unit_id": "<uuid uit AsyncStorage>",
+  "source": "android-bg"
+}
+unit_id is verplicht voor correcte koppeling. Als het ontbreekt, log dat expliciet en skip de POST.
+
+Bridge events worden afgevangen:
+
+window.CMDS_NATIVE.onUnitLinked({unitId, callSign, eventId, organizationId}) → schrijf unitId naar AsyncStorage key cmds_active_unit_id + start background service.
+window.CMDS_NATIVE.onUnitUnlinked() → wis key + stop background service.
+window.CMDS_NATIVE.onSupabaseTokenRefreshed({accessToken,...}) → update in-memory token cache direct.
+Foreground service is gestart met foregroundServiceType="location" en runt ook als app in background staat.
+
+Op app-start vóór de webview iets stuurt: dispatch window.dispatchEvent(new Event('cmds-native-request-unit-sync')) zodra de webview DOMContentLoaded heeft. De webview pusht dan opnieuw onUnitLinked als er een actieve unit is.
+
+DEEL 2 — Native Backend Log (in-app diagnose scherm)
+Bouw een nieuw scherm "Ingest Diagnose" in de native shell, bereikbaar via een knop in het bestaande diagnose-menu. Dit moet in-app werken zonder ADB.
+
+Implementatie
+Maak een ringbuffer (laatste 200 entries) in de native shell die elke ingest-actie logt naar AsyncStorage key cmds_ingest_log (JSON array). Elke entry:
+
+
+{
+  ts: "2026-05-02T05:36:12.123Z",
+  phase: "tick" | "post_attempt" | "post_response" | "skip" | "bridge_event" | "token_refresh" | "service_state",
+  detail: {
+    // afhankelijk van phase, voorbeelden:
+    unitId?: string | null,
+    hasToken?: boolean,
+    tokenExpiresIn?: number,  // seconden
+    url?: string,
+    httpStatus?: number,
+    responseBody?: string,    // max 500 chars
+    skipReason?: string,
+    bridgeEvent?: "onUnitLinked" | "onUnitUnlinked" | "onSupabaseTokenRefreshed",
+    bridgePayload?: object,
+    serviceRunning?: boolean,
+    error?: string,
+  }
+}
+Log op deze momenten
+Moment	phase	detail
+Bridge event ontvangen	bridge_event	event-naam + payload
+Token refresh ontvangen	token_refresh	nieuwe expiresAt
+Background service start/stop	service_state	serviceRunning
+Vóór elke POST-poging	post_attempt	url, hasToken, unitId, lat/lng
+Na elke POST-respons	post_response	httpStatus, responseBody (eerste 500 chars)
+Skip (geen unit / geen token / geen GPS)	skip	skipReason
+Locatie-tick zonder POST	tick	reden waarom niet gepost
+Network error	post_response	error veld gevuld
+UI van het scherm
+Bovenin: huidige status (3 regels):
+Active unitId: <uuid of "—">
+Token: <geldig nog Xs of "ontbreekt">
+Service: <running|stopped>
+Knoppen: Refresh · Wis log · Kopieer alle entries naar clipboard
+Lijst: alle entries omgekeerd-chronologisch, met kleurcoding:
+groen = post_response met status 200
+rood = post_response met status ≥400 of error
+geel = skip
+grijs = tick / service_state / bridge_event / token_refresh
+De kopieerknop levert plain-text JSON dat ik in chat kan plakken.
+
+DEEL 3 — Sanity check vóór APK-build
+Run één keer handmatig vanuit de native shell (devtools console of adb shell am):
+
+
+curl -i -X POST \
+  https://txauyjkivyzgxetmadkj.supabase.co/functions/v1/ingest-location \
+  -H "Authorization: Bearer <plak hier het token uit AsyncStorage>" \
+  -H "apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR4YXV5amtpdnl6Z3hldG1hZGtqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE4NTQ4MDQsImV4cCI6MjA4NzQzMDgwNH0.PEm8ItUT-9D1PJLwBXEydKYf-cPUQdQhQdLEnkWC-hk" \
+  -H "Content-Type: application/json" \
+  -d '{"latitude":52.37,"longitude":4.89,"accuracy":10,"timestamp":'$(date +%s000)',"unit_id":"ddb85933-ea2f-46f4-8119-16838e761abc","source":"manual-test"}'
+Verwacht antwoord: {"ok":true,"unit_id":"ddb85933-ea2f-46f4-8119-16838e761abc"}. Als dit faalt, ligt het aan token/URL en niet aan background-code.
+
+Oplevering
+Bevestig DEEL 1 met ✅/❌ + regelverwijzingen.
+Lever screenshot van DEEL 3 curl-respons.
+Build APK met DEEL 2 diagnose-scherm.
+Stuur APK + plak de gekopieerde JSON-log van het diagnose-scherm na: login → kies BRAVO 1 → wacht 60s → app naar background → wacht 60s → app weer open.
+Dan kunnen we exact zien of er ge-POST wordt en wat Supabase teruggeeft.

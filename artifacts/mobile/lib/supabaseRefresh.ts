@@ -10,12 +10,14 @@
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
+import { emitBridgeEvent } from "./bridgeEvents";
+
 // ---------------------------------------------------------------------------
 // Supabase anon key (public — veilig om in te hardcoden, net als de URL).
 // Vind het via: Supabase dashboard → Project Settings → API → "anon public"
 // Plak de volledige sleutel hieronder (begint met "eyJ...").
 // ---------------------------------------------------------------------------
-const SUPABASE_ANON_KEY =
+export const SUPABASE_ANON_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR4YXV5amtpdnl6Z3hldG1hZGtqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE4NTQ4MDQsImV4cCI6MjA4NzQzMDgwNH0.PEm8ItUT-9D1PJLwBXEydKYf-cPUQdQhQdLEnkWC-hk";
 
 const SUPABASE_PROJECT_REF = "txauyjkivyzgxetmadkj";
@@ -84,8 +86,28 @@ export type RefreshResult = {
  * - Bij 4xx: wist alle tokens (sessie ongeldig), return null.
  * - Bij netwerkfout / 5xx: laat tokens intact, return null (volgende tick
  *   probeert het opnieuw).
+ *
+ * CONCURRENCY LOCK: als er al een refresh in-flight is (bijv. doordat expo-location
+ * na Doze-lift 25 locaties tegelijk aanlevert en elke callback onafhankelijk een
+ * refresh triggert), wachten alle extra callers op dezelfde Promise. Zo wordt het
+ * Supabase rotate-token nooit dubbel geconsumeerd.
  */
+let _refreshInFlight: Promise<RefreshResult | null> | null = null;
+
 export async function refreshSupabaseTokenNative(): Promise<RefreshResult | null> {
+  if (_refreshInFlight !== null) {
+    console.log("[CMDS-GPS] refresh-token: al in-flight, wacht op lopende refresh");
+    return _refreshInFlight;
+  }
+  _refreshInFlight = _doRefresh();
+  try {
+    return await _refreshInFlight;
+  } finally {
+    _refreshInFlight = null;
+  }
+}
+
+async function _doRefresh(): Promise<RefreshResult | null> {
   const refreshToken = await AsyncStorage.getItem(REFRESH_TOKEN_KEY);
   if (!refreshToken) {
     console.log("[CMDS-GPS] refresh-token: geen refresh token in storage");
@@ -142,6 +164,13 @@ export async function refreshSupabaseTokenNative(): Promise<RefreshResult | null
       console.log(
         `[CMDS-GPS] refresh-token OK — nieuw token voor user=${body.user.id} expires=${body.expires_at}`,
       );
+      // Bridge event → WebView zodat de webapp weet dat het token ververst is.
+      // De webapp kan hierop reageren door bijv. de token-status indicator bij
+      // te werken. Werkt alleen vanuit foreground context.
+      emitBridgeEvent("onSupabaseTokenRefreshed", {
+        expiresAt: body.expires_at,
+        userId: body.user.id,
+      });
       return {
         accessToken: body.access_token,
         refreshToken: body.refresh_token,
@@ -161,6 +190,8 @@ export async function refreshSupabaseTokenNative(): Promise<RefreshResult | null
       ]);
       updateAccessToken(null);
       invalidateExpiresAtCache();
+      // Bridge event → WebView: laat de webapp een relogin-scherm tonen.
+      emitBridgeEvent("onAuthExpired", {});
       return null;
     }
 

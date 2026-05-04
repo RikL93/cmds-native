@@ -1,6 +1,32 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
 import * as IntentLauncher from "expo-intent-launcher";
 import { Platform } from "react-native";
+
+// Wordt op "true" gezet zodra de gebruiker de batterijoptimalisatie-flow
+// heeft doorlopen (tik op "Instellen"). We bewaren dit in AsyncStorage zodat
+// we op elke unit-koppeling kunnen re-checken en een banner kunnen tonen.
+const BATTERY_OPT_GRANTED_KEY = "cmds.batteryOptGranted";
+
+/**
+ * Geeft true als de gebruiker eerder de batterijoptimalisatie-flow
+ * heeft doorlopen (tik op "Instellen" gevolgd door systeem-dialog).
+ * Op iOS altijd true (niet van toepassing).
+ */
+export async function isIgnoringBatteryOptimizationsGranted(): Promise<boolean> {
+  if (Platform.OS !== "android") return true;
+  const val = await AsyncStorage.getItem(BATTERY_OPT_GRANTED_KEY);
+  return val === "1";
+}
+
+/**
+ * Markeer dat de gebruiker de batterijoptimalisatie-dialog heeft geopend.
+ * We nemen aan dat de gebruiker "Toestaan" heeft getikt; we kunnen dit
+ * niet verificeren zonder custom native code.
+ */
+export async function markBatteryOptGranted(): Promise<void> {
+  await AsyncStorage.setItem(BATTERY_OPT_GRANTED_KEY, "1");
+}
 
 /**
  * Returns the Android package id for this build (e.g. "nl.cmds.app").
@@ -16,17 +42,26 @@ function getAndroidPackage(): string | null {
 }
 
 /**
- * Opens the Android system dialog that asks the user to exempt this app from
- * battery optimisation. After "Toestaan" the OS will no longer kill the
- * background location service to save battery.
+ * Probeert het Android-systeemdialoogvenster te openen dat de gebruiker vraagt
+ * om de app uit te sluiten van batterijoptimalisatie.
  *
- * Returns true if the dialog was launched, false on iOS or when no Android
- * package id is available.
+ * Vereist android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS in het manifest
+ * (toegevoegd via app.plugin.js). Zonder die permissie gooit Android een
+ * SecurityException die stil wordt gevangen.
+ *
+ * Fallback-keten:
+ *   1. REQUEST_IGNORE_BATTERY_OPTIMIZATIONS  — direct pop-up "Toestaan / Weigeren"
+ *   2. IGNORE_BATTERY_OPTIMIZATION_SETTINGS  — lijst van alle apps; gebruiker scrolt naar CMDS
+ *   3. APPLICATION_DETAILS_SETTINGS          — app-infopagina; gebruiker tikt Batterij → Onbeperkt
+ *
+ * Geeft true als minstens één scherm geopend is, false als alles mislukt.
  */
 export async function requestIgnoreBatteryOptimizations(): Promise<boolean> {
   if (Platform.OS !== "android") return false;
   const pkg = getAndroidPackage();
   if (!pkg) return false;
+
+  // Poging 1: directe systeem-popup (vereist REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permissie)
   try {
     await IntentLauncher.startActivityAsync(
       "android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
@@ -34,17 +69,21 @@ export async function requestIgnoreBatteryOptimizations(): Promise<boolean> {
     );
     return true;
   } catch {
-    // Fallback: open the global battery optimisation list so the user can
-    // toggle it manually for CMDS.
-    try {
-      await IntentLauncher.startActivityAsync(
-        "android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS",
-      );
-      return true;
-    } catch {
-      return false;
-    }
+    // Permissie ontbreekt, of OEM blokkeert dit intent → volgende poging
   }
+
+  // Poging 2: lijst van alle apps met batterijoptimalisatie-instellingen
+  try {
+    await IntentLauncher.startActivityAsync(
+      "android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS",
+    );
+    return true;
+  } catch {
+    // Sommige OEMs (MIUI, EMUI) ondersteunen dit scherm niet → volgende poging
+  }
+
+  // Poging 3: app-detailpagina → gebruiker tikt zelf op "Batterij" → "Geen beperkingen"
+  return openAppDetailsSettings();
 }
 
 /**

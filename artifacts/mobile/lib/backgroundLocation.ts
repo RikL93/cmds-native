@@ -15,8 +15,13 @@ import {
   getTokenExpiresAt,
   invalidateExpiresAtCache,
   refreshSupabaseTokenNative,
+  SUPABASE_ANON_KEY,
   updateAccessToken as _updateAccessToken,
 } from "./supabaseRefresh";
+import { logIngest } from "./ingestLog";
+import { emitBridgeEvent } from "./bridgeEvents";
+import { drainQueue, enqueueLocation } from "./locationQueue";
+import { CmdsLocation } from "../modules/cmds-location";
 
 // Re-export updateAccessToken so app/index.tsx can keep importing it from here.
 export { updateAccessToken } from "./supabaseRefresh";
@@ -31,6 +36,19 @@ export const DIAGNOSTICS_STORAGE_KEY = "cmds.diagnostics";
 
 const BACKGROUND_LINKED_CHECK_TTL_MS = 30_000;
 const FOREGROUND_LINKED_CHECK_TTL_MS = 60_000; // cache whoami 60s — saves ~6 req/min/device
+
+// Sleutel voor cross-context post-throttle (AsyncStorage → werkt ook tussen
+// afzonderlijke Expo background task instances die Doze tegelijk loslaat).
+const GLOBAL_LAST_POST_STARTED_KEY = "cmds_gps_last_post_started";
+// Maximaal 1 GPS-post per 8 seconden, ongeacht bron. Voorkomt de burst van
+// 4-5 gelijktijdige expo-bg posts die Android vrijlaat na een Doze-periode.
+const GLOBAL_POST_THROTTLE_MS = 8_000;
+
+// In-memory guard: verhindert gelijktijdige post-pogingen BINNEN dezelfde
+// JS-context (bijv. foreground watcher + background task die tegelijk starten).
+// Aparte background-task instanties starten elk met _postInFlight = false;
+// voor cross-context throttling gebruikt postLocationIfLinked AsyncStorage.
+let _postInFlight = false;
 
 type BackgroundTaskBody = {
   data?: { locations?: Location.LocationObject[] };
@@ -86,6 +104,17 @@ const DEFAULT_DIAGNOSTICS: Diagnostics = {
 // getCurrentPositionAsync(), which can hang for 30-60s without a satellite fix.
 // ---------------------------------------------------------------------------
 let _lastKnownLocation: Location.LocationObject | null = null;
+
+// Bewaar het actieve callSign zodat startBackgroundLocation() weet of de
+// foreground-service notificatie bijgewerkt moet worden.
+// In-memory: wordt bij JS-runtime-kill gereset naar null. Persisted via
+// AsyncStorage zodat we na een achtergrond-kill niet onnodig stop+herstart.
+let _activeCallSign: string | null = null;
+const ACTIVE_CALL_SIGN_KEY = "cmds_active_call_sign_service";
+
+// Mutex: voorkomt gelijktijdige startBackgroundLocation() aanroepen die
+// elk een stop+herstart triggeren (race condition bij AppState+onUnitLinked).
+let _startLocationInProgress = false;
 
 // Throttle: postForegroundLocation() is now called directly from the watcher
 // callback (every ~5s). We only actually POST every 10s so the backend sees
@@ -186,6 +215,7 @@ function buildPayload(
   source: string,
   unitId: string | null,
 ): Record<string, unknown> {
+  const isoTime = new Date(location.timestamp).toISOString();
   const body: Record<string, unknown> = {
     latitude: location.coords.latitude,
     longitude: location.coords.longitude,
@@ -194,7 +224,10 @@ function buildPayload(
     altitude_accuracy: location.coords.altitudeAccuracy,
     speed: location.coords.speed,
     heading: location.coords.heading,
-    recorded_at: new Date(location.timestamp).toISOString(),
+    recorded_at: isoTime,
+    // CRITICAL FIX: edge function verwacht timestamp als number (ms), niet als ISO string.
+    // Fout was: {"error":"Invalid body","details":{"timestamp":["Expected number, received string"]}}
+    timestamp: location.timestamp, // number (ms epoch)
     source,
   };
   if (unitId) body.unit_id = unitId;
@@ -213,6 +246,14 @@ async function postLocation(
   console.log(
     `[CMDS-GPS] before-fetch ingest-location lat=${payload.latitude} lng=${payload.longitude} source=${source} tokenLen=${accessToken.length}`,
   );
+  void logIngest("post_attempt", {
+    url: LOCATION_ENDPOINT,
+    hasToken: true,
+    unitId: typeof payload.unit_id === "string" ? payload.unit_id : null,
+    lat: payload.latitude as number,
+    lng: payload.longitude as number,
+    source,
+  });
   try {
     const ctrl = new AbortController();
     const abortTimer = setTimeout(() => ctrl.abort(), 15_000);
@@ -222,6 +263,7 @@ async function postLocation(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          apikey: SUPABASE_ANON_KEY,
           Authorization: `Bearer ${accessToken}`,
         },
         body: JSON.stringify(payload),
@@ -241,6 +283,11 @@ async function postLocation(
       `[CMDS-GPS] after-fetch ingest-location status=${response.status} ms=${took} body=${bodyText.slice(0, 120)} source=${source}`,
     );
     const current = await getDiagnostics();
+    void logIngest("post_response", {
+      httpStatus: response.status,
+      responseBody: bodyText.slice(0, 500),
+      source,
+    });
     if (response.ok) {
       await patchDiagnostics({
         lastPostAt: new Date().toISOString(),
@@ -249,6 +296,14 @@ async function postLocation(
         lastPostBody: bodyText.slice(0, 500),
         lastPostSource: source,
         postSuccessCount: current.postSuccessCount + 1,
+      });
+      // Bridge event → WebView (ingest-diagnose panel / map status indicator).
+      // Werkt alleen vanuit foreground context; achtergrond-tasks negeren dit.
+      emitBridgeEvent("onLocationPosted", {
+        status: response.status,
+        source,
+        lat: payload.latitude,
+        lng: payload.longitude,
       });
     } else {
       await patchDiagnostics({
@@ -259,6 +314,15 @@ async function postLocation(
         lastPostSource: source,
         postFailureCount: current.postFailureCount + 1,
       });
+      // Niet-netwerk fout (bijv. 400, 500) — willRetry=false, niet enqueueable
+      if (source !== "queue-retry") {
+        emitBridgeEvent("onLocationPostError", {
+          status: response.status,
+          message: `HTTP ${response.status}`,
+          willRetry: false,
+          source,
+        });
+      }
     }
     return response.status;
   } catch (e) {
@@ -267,6 +331,7 @@ async function postLocation(
     console.log(
       `[CMDS-GPS] POST /ingest-location → NETWORK ERROR ${errMsg}, took=${took}ms (source=${source})`,
     );
+    void logIngest("post_response", { error: errMsg, source });
     const current = await getDiagnostics();
     await patchDiagnostics({
       lastPostAt: new Date().toISOString(),
@@ -283,6 +348,7 @@ async function postLocation(
 async function recordSkip(reason: string, source: string): Promise<void> {
   const current = await getDiagnostics();
   console.log(`[CMDS-GPS] SKIP /ingest-location → ${reason} (source=${source})`);
+  void logIngest("skip", { skipReason: reason, source });
   await patchDiagnostics({
     postSkippedCount: current.postSkippedCount + 1,
     lastSkipReason: reason,
@@ -299,31 +365,109 @@ async function recordSkip(reason: string, source: string): Promise<void> {
  * the token from AsyncStorage — the website's autoRefreshToken may have
  * updated it already — and retry once with the new token.
  */
+/**
+ * skipTokenRefresh: als true worden ALLE token-refresh pogingen overgeslagen
+ * (zowel proactief als reactief op 401). Gebruik dit op Android in de Expo
+ * background task om token-conflicts met de Kotlin SupabaseTokenManager te
+ * voorkomen: de Kotlin service beheert tokens via SharedPreferences; als de
+ * Expo task ook probeert te refreshen met een (mogelijk verouderd) refresh_token
+ * uit AsyncStorage, roteren beide gelijktijdig → "refresh_token_already_used"
+ * → Supabase revoceert de sessie → gedwongen logout.
+ *
+ * Met skipTokenRefresh=true POST de Expo task gewoon met het huidige token.
+ * Bij 401 slaat hij over (de Kotlin service zorgt voor een vers token).
+ */
 export async function postLocationIfLinked(
   location: Location.LocationObject,
   source: string,
   linkedTtlMs: number,
+  options: { skipTokenRefresh?: boolean } = {},
 ): Promise<void> {
-  console.log(`[CMDS-GPS] postLocationIfLinked called (source=${source})`);
+  // ── In-memory guard (binnen dezelfde JS-context) ─────────────────────────
+  // Verhindert dat de foreground watcher en de background task gelijktijdig
+  // een POST starten in dezelfde JS-runtime. Aparte background-task instances
+  // starten elk met _postInFlight = false; die worden door de AsyncStorage-
+  // throttle hieronder beperkt.
+  if (_postInFlight) {
+    console.log(`[CMDS-GPS] in-memory guard: al een post in-flight — skip (source=${source})`);
+    return;
+  }
+  _postInFlight = true;
+  try {
+    await _postLocationIfLinkedInner(location, source, linkedTtlMs, options);
+  } finally {
+    _postInFlight = false;
+  }
+}
+
+async function _postLocationIfLinkedInner(
+  location: Location.LocationObject,
+  source: string,
+  linkedTtlMs: number,
+  options: { skipTokenRefresh?: boolean } = {},
+): Promise<void> {
+  const skipTokenRefresh = options.skipTokenRefresh ?? false;
+  console.log(`[CMDS-GPS] postLocationIfLinked called (source=${source} skipRefresh=${skipTokenRefresh})`);
   let accessToken = await getSupabaseAccessToken();
+
+  // ── Native token fallback (Android met skipTokenRefresh=true) ────────────
+  // De Kotlin SupabaseTokenManager slaat tokens op in SharedPreferences.
+  // Wanneer het scherm uit is, verwerkt de JS-laag de onSupabaseTokenRefreshed
+  // events niet → AsyncStorage token wordt stale/null terwijl de Kotlin service
+  // een geldig token heeft. In dat geval lezen we het token direct uit de
+  // native SharedPreferences via CmdsLocation.getAccessToken().
+  if (!accessToken && skipTokenRefresh && Platform.OS === "android") {
+    console.log("[CMDS-GPS] AsyncStorage token null — probeer native token fallback");
+    const nativeToken = await CmdsLocation.getAccessToken().catch(() => null);
+    if (nativeToken) {
+      console.log(`[CMDS-GPS] native token fallback gelukt (len=${nativeToken.length})`);
+      accessToken = nativeToken;
+      // Sync terug naar AsyncStorage zodat toekomstige calls geen fallback nodig hebben
+      _updateAccessToken(nativeToken);
+      await AsyncStorage.setItem(ACCESS_TOKEN_KEY, nativeToken);
+    }
+  }
+
   if (!accessToken) {
     console.log("POST ingest-location SKIP: no token", { source });
     await recordSkip("geen token — log in op de website", source);
     return;
   }
 
+  // ── Globale cross-context post-throttle ─────────────────────────────────
+  // Doze mode stelt Expo background task-uitvoeringen op en laat ze tegelijk
+  // los bij de eerste maintenance window (scherm aan / netwerk beschikbaar).
+  // AsyncStorage werkt cross-context (elke background task instance leest
+  // dezelfde waarde) en beperkt zo de burst tot max 1 post per 8 seconden.
+  const lastStartedRaw = await AsyncStorage.getItem(GLOBAL_LAST_POST_STARTED_KEY);
+  if (lastStartedRaw) {
+    const age = Date.now() - Number(lastStartedRaw);
+    if (age >= 0 && age < GLOBAL_POST_THROTTLE_MS) {
+      console.log(
+        `[CMDS-GPS] global throttle: ${Math.round(age / 1000)}s since last post — skip (source=${source})`,
+      );
+      return;
+    }
+  }
+  // Schrijf de timestamp VOOR de POST zodat concurrente calls deze zien.
+  await AsyncStorage.setItem(GLOBAL_LAST_POST_STARTED_KEY, String(Date.now()));
+
   // ── Proactieve refresh ──────────────────────────────────────────────────
-  const expiresAt = await getTokenExpiresAt();
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (expiresAt !== null && expiresAt - nowSec < 120) {
-    console.log(
-      `[CMDS-GPS] token verloopt over ${expiresAt - nowSec}s — proactieve refresh`,
-    );
-    const refreshed = await refreshSupabaseTokenNative();
-    if (refreshed) {
-      accessToken = refreshed.accessToken;
-      invalidateLinkedUnitCache();
-      invalidateExpiresAtCache();
+  // Op Android (expo-bg) overgeslagen: de Kotlin SupabaseTokenManager beheert
+  // token-rotatie via SharedPreferences. Dubbele refresh → token-conflict.
+  if (!skipTokenRefresh) {
+    const expiresAt = await getTokenExpiresAt();
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (expiresAt !== null && expiresAt - nowSec < 2400) {
+      console.log(
+        `[CMDS-GPS] token verloopt over ${expiresAt - nowSec}s — proactieve refresh (drempel 2400s)`,
+      );
+      const refreshed = await refreshSupabaseTokenNative();
+      if (refreshed) {
+        accessToken = refreshed.accessToken;
+        invalidateLinkedUnitCache();
+        invalidateExpiresAtCache();
+      }
     }
   }
 
@@ -340,7 +484,7 @@ export async function postLocationIfLinked(
     const payload = buildPayload(location, source, unitId);
     let status = await postLocation(payload, accessToken, source);
 
-    if (status === 401) {
+    if (status === 401 && !skipTokenRefresh) {
       console.log("[CMDS-GPS] 401 — native token refresh proberen (bridge pad)");
       const refreshed = await refreshSupabaseTokenNative();
       if (refreshed) {
@@ -358,6 +502,33 @@ export async function postLocationIfLinked(
       }
       if (status === 401) {
         console.log("[CMDS-GPS] AUTH FAILED — refresh exhausted (bridge pad)");
+      }
+    } else if (status === 401 && skipTokenRefresh) {
+      console.log("[CMDS-GPS] 401 ontvangen maar skipTokenRefresh=true — skip (Kotlin service verversst token)");
+    }
+
+    // ── Queue/drain na bridge pad ────────────────────────────────────────
+    if (status === null) {
+      // Netwerkverlies — bewaar voor later
+      await enqueueLocation(payload, accessToken, source);
+    } else if (status >= 200 && status < 300) {
+      // POST gelukt → update diagnostics zodat "Eenheid gekoppeld" en
+      // "Eenheid laatst gecontroleerd" actueel blijven. Zonder dit worden
+      // beide velden nooit bijgewerkt op de bridge-pad (whoami wordt
+      // overgeslagen), waardoor de diagnostics bevroren blijven op de
+      // laatste whoami-check (mogelijk uren of dagen geleden).
+      const storedCallSign = await AsyncStorage.getItem(
+        "cmds_active_unit_call_sign",
+      );
+      await patchDiagnostics({
+        lastLinkedCheckAt: new Date().toISOString(),
+        lastLinkedStatus: "linked",
+        lastLinkedCallSign: storedCallSign,
+        lastLinkedError: null,
+      });
+      if (source !== "queue-retry") {
+        // POST gelukt → spoel pending queue door (non-blocking)
+        void drainQueue((p, t, s) => postLocation(p, t, s), accessToken);
       }
     }
     return;
@@ -388,7 +559,9 @@ export async function postLocationIfLinked(
 
   // ── Reactieve 401-retry ─────────────────────────────────────────────────
   // Volgorde: 1) native refresh proberen, 2) fallback op storage re-read.
-  if (status === 401) {
+  // Op Android (skipTokenRefresh=true) overgeslagen: de Kotlin service zorgt
+  // voor een vers token, de Expo task post de volgende keer met het nieuwe token.
+  if (status === 401 && !skipTokenRefresh) {
     console.log(
       "[CMDS-GPS] 401 ontvangen — native token refresh proberen",
     );
@@ -424,6 +597,17 @@ export async function postLocationIfLinked(
     if (status === 401) {
       console.log("[CMDS-GPS] AUTH FAILED — refresh exhausted");
     }
+  } else if (status === 401 && skipTokenRefresh) {
+    console.log("[CMDS-GPS] 401 ontvangen maar skipTokenRefresh=true — skip (Kotlin service verversst token)");
+  }
+
+  // ── Queue/drain na whoami pad ────────────────────────────────────────────
+  if (status === null) {
+    // Netwerkverlies — bewaar voor later
+    await enqueueLocation(payload, accessToken, source);
+  } else if (status >= 200 && status < 300 && source !== "queue-retry") {
+    // POST gelukt → spoel pending queue door (non-blocking)
+    void drainQueue((p, t, s) => postLocation(p, t, s), accessToken);
   }
 }
 
@@ -460,47 +644,148 @@ if (Platform.OS !== "web" && !TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
       });
     }
 
+    // Skip POST when Kotlin foreground service is the active poster (Android).
+    // Avoids dual posters racing the unit_locations upsert (HTTP 500).
+    if (Platform.OS === "android") {
+      try {
+        if (await CmdsLocation.isServiceRunning()) {
+          await patchDiagnostics({
+            lastSkipReason: "kotlin_primary_poster_running",
+            postSkippedCount: (await getDiagnostics()).postSkippedCount + 1,
+          });
+          return;
+        }
+      } catch {
+        // Module unavailable on older builds → fall through to JS POST.
+      }
+    }
+
     for (const location of locations) {
       await postLocationIfLinked(
         location,
         "expo-bg",
         BACKGROUND_LINKED_CHECK_TTL_MS,
+        // Op Android beheert de Kotlin SupabaseTokenManager tokens via
+        // SharedPreferences. De Expo task moet NOOIT zelf het token refreshen:
+        // twee gelijktijdige refresh-pogingen → "refresh_token_already_used"
+        // → Supabase revoceert de sessie → gedwongen logout.
+        { skipTokenRefresh: Platform.OS === "android" },
       );
     }
   });
 }
 
-export async function startBackgroundLocation(): Promise<void> {
+/**
+ * Start (of herstart) de achtergrond-locatieservice.
+ *
+ * @param callSign  Optioneel: call sign van de gekoppelde eenheid, bijv.
+ *                  "DELTA 1". Wordt getoond in de persistent notification
+ *                  als titel "CMDS — DELTA 1 actief". Als de service al
+ *                  draait met hetzelfde callSign, wordt hij NIET herstart.
+ *                  Bij een nieuw callSign wordt de service kort gestopt en
+ *                  opnieuw gestart zodat de notificatietitel bijgewerkt wordt.
+ */
+export async function startBackgroundLocation(
+  callSign?: string,
+): Promise<void> {
   if (Platform.OS === "web") return;
 
-  const alreadyStarted =
-    await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
-  if (alreadyStarted) {
+  // ── Mutex: voorkomt gelijktijdige aanroepen ──────────────────────────────
+  // Probleem: AppState-useEffect en onUnitLinked-handler roepen beiden
+  // startBackgroundLocation() aan na app-naar-voorgrond. Beide zien
+  // _activeCallSign=null (JS-runtime kill reset het) → beide triggeren
+  // een stop+herstart → twee GPS-gaten direct na voorgrond-terugkeer.
+  // Oplossing: zodra een aanroep begint, blokkeren we de rest.
+  if (_startLocationInProgress) {
+    console.log("[CMDS-GPS] startBackgroundLocation: al bezig — skip");
     return;
   }
+  _startLocationInProgress = true;
 
-  await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
-    accuracy: Location.Accuracy.High,
-    timeInterval: 30_000,
-    distanceInterval: 0,
-    deferredUpdatesInterval: 30_000,
-    showsBackgroundLocationIndicator: true,
-    pausesUpdatesAutomatically: false,
-    foregroundService: {
-      notificationTitle: "CMDS deelt je locatie",
-      notificationBody:
-        "GPS wordt op de achtergrond gedeeld met cmdsevent.nl.",
-      notificationColor: "#0b1d3a",
-    },
-  });
+  try {
+    // ── Herstel _activeCallSign uit AsyncStorage na JS-runtime-kill ─────────
+    // Wanneer Android de JS-runtime killt (bijv. Doze, OEM battery manager)
+    // wordt _activeCallSign gereset naar null. Bij de eerstvolgende aanroep
+    // lezen we de opgeslagen waarde zodat we niet onnodig stop+herstart doen
+    // als het callSign onveranderd is.
+    if (_activeCallSign === null) {
+      try {
+        const stored = await AsyncStorage.getItem(ACTIVE_CALL_SIGN_KEY);
+        if (stored) _activeCallSign = stored;
+      } catch {
+        // Non-critical — proceed with null
+      }
+    }
+
+    const alreadyStarted =
+      await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
+
+    if (alreadyStarted) {
+      // Geen callSign-wijziging — niets te doen
+      if (!callSign || callSign === _activeCallSign) return;
+      // Nieuw callSign — stop de service om de notificatietitel bij te werken.
+      // KRITIEK: zet _activeCallSign VÓÓR de await zodat gelijktijdige aanroepen
+      // (die ondanks de mutex toch doorglipten via _startLocationInProgress=false
+      // op de vorige iteratie) de nieuwe waarde zien.
+      _activeCallSign = callSign;
+      try {
+        await AsyncStorage.setItem(ACTIVE_CALL_SIGN_KEY, callSign);
+      } catch { /* non-critical */ }
+      void logIngest("service_state", {
+        serviceRunning: false,
+        source: "callSign_update",
+      });
+      await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
+    } else {
+      // Service was niet actief — sla callSign op vóór de start
+      _activeCallSign = callSign ?? null;
+      if (callSign) {
+        try {
+          await AsyncStorage.setItem(ACTIVE_CALL_SIGN_KEY, callSign);
+        } catch { /* non-critical */ }
+      }
+    }
+
+    const notifTitle = callSign ? `CMDS — ${callSign} actief` : "CMDS deelt je locatie";
+
+    void logIngest("service_state", {
+      serviceRunning: true,
+      source: callSign ?? undefined,
+    });
+    await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
+      accuracy: Location.Accuracy.High,
+      // KRITIEK: 10s interval — was 30s. Elke 10s een fix ook bij stilstand.
+      timeInterval: 10_000,
+      distanceInterval: 0,
+      // deferredUpdatesInterval op 10s voorkomt dat Android updates batcht
+      // en vertraagd aanlevert tijdens Doze-mode.
+      deferredUpdatesInterval: 10_000,
+      deferredUpdatesDistance: 0,
+      showsBackgroundLocationIndicator: true,
+      pausesUpdatesAutomatically: false,
+      foregroundService: {
+        notificationTitle: notifTitle,
+        notificationBody: "Locatie wordt gedeeld met de meldkamer.",
+        notificationColor: "#0b1d3a",
+      },
+    });
+  } finally {
+    _startLocationInProgress = false;
+  }
 }
 
 export async function stopBackgroundLocation(): Promise<void> {
   if (Platform.OS === "web") return;
 
+  _activeCallSign = null;
+  try {
+    await AsyncStorage.removeItem(ACTIVE_CALL_SIGN_KEY);
+  } catch { /* non-critical */ }
+
   const isStarted =
     await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
   if (isStarted) {
+    void logIngest("service_state", { serviceRunning: false });
     await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
   }
 }

@@ -1,0 +1,17 @@
+{
+  "name": "cmds-location",
+  "version": "1.0.0",
+  "description": "Native Android GPS foreground service for CMDS",
+  "main": "./index",
+  "types": "./index.ts",
+  "exports": {
+    ".": {
+      "types": "./index.ts",
+      "default": "./index"
+    }
+  },
+  "peerDependencies": {
+    "expo": "*",
+    "expo-modules-core": "*"
+  }
+}
