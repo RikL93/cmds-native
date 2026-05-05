@@ -721,22 +721,18 @@ export async function startBackgroundLocation(
       await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
 
     if (alreadyStarted) {
-      // Geen callSign-wijziging — niets te doen
-      if (!callSign || callSign === _activeCallSign) return;
-      // Nieuw callSign — stop de service om de notificatietitel bij te werken.
-      // KRITIEK: zet _activeCallSign VÓÓR de await zodat gelijktijdige aanroepen
-      // (die ondanks de mutex toch doorglipten via _startLocationInProgress=false
-      // op de vorige iteratie) de nieuwe waarde zien.
-      _activeCallSign = callSign;
-      try {
-        await AsyncStorage.setItem(ACTIVE_CALL_SIGN_KEY, callSign);
-      } catch { /* non-critical */ }
-      void logIngest("service_state", {
-        serviceRunning: false,
-        source: "callSign_update",
-        ...(await fetchDiagnosticsForLog()),
-      });
-      await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
+      // GPS-task draait al. Geen stop/start — dat onderbreekt de Expo
+      // foreground service en Android 14 laat hem op de achtergrond niet
+      // opnieuw starten (ForegroundServiceStartNotAllowedException).
+      // Update alleen het in-memory callSign en sla het op; de notificatietitel
+      // blijft zoals hij was. Dat is acceptabel — de GPS-stream gaat door.
+      if (callSign && callSign !== _activeCallSign) {
+        _activeCallSign = callSign;
+        try {
+          await AsyncStorage.setItem(ACTIVE_CALL_SIGN_KEY, callSign);
+        } catch { /* non-critical */ }
+      }
+      return;
     } else {
       // Service was niet actief — sla callSign op vóór de start
       _activeCallSign = callSign ?? null;

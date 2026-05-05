@@ -1684,6 +1684,35 @@ export default function Index() {
               if (entry.detail.responseBody) {
                 lines.push(entry.detail.responseBody.slice(0, 120));
               }
+              // Toon de Doze/battery/OEM diagnose-velden als 2e regel,
+              // maar alleen als er minstens één van aanwezig is. Zo zie je
+              // per service_state event direct of het toestel toen in Doze
+              // stond, of de battery-opt vrijstelling miste, etc.
+              const d = entry.detail;
+              const hasDiag =
+                d.dozeMode != null ||
+                d.batteryOptIgnored != null ||
+                d.standbyBucket != null ||
+                d.standbyBucketLabel != null ||
+                d.manufacturer != null ||
+                d.model != null ||
+                d.sdkInt != null;
+              if (hasDiag) {
+                const parts: string[] = [];
+                if (d.dozeMode != null) parts.push(`doze=${d.dozeMode}`);
+                if (d.batteryOptIgnored != null)
+                  parts.push(`battOpt=${d.batteryOptIgnored ? "ok" : "BLOCK"}`);
+                if (d.standbyBucketLabel)
+                  parts.push(`bucket=${d.standbyBucketLabel}`);
+                else if (d.standbyBucket != null)
+                  parts.push(`bucket=${d.standbyBucket}`);
+                if (d.manufacturer || d.model)
+                  parts.push(
+                    `dev=${d.manufacturer ?? "?"}/${d.model ?? "?"}`,
+                  );
+                if (d.sdkInt != null) parts.push(`sdk=${d.sdkInt}`);
+                lines.push(`  └─ ${parts.join(" ")}`);
+              }
               return (
                 <View key={i} style={styles.ingestEntry}>
                   <Text style={[styles.ingestEntryText, { color: textColor }]}>
