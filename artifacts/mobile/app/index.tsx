@@ -57,6 +57,7 @@ import {
   logIngest,
   type IngestLogEntry,
 } from "@/lib/ingestLog";
+import { BUILD_FINGERPRINT } from "@/lib/buildInfo";
 
 const TARGET_URL = "https://cmdsevent.nl";
 const SUPABASE_PROJECT_REF = "txauyjkivyzgxetmadkj";
@@ -204,6 +205,31 @@ const INJECTED_BRIDGE = `
           ts: new Date().toISOString(),
         });
       } catch(e) { return '{"error":"failed"}'; }
+    },
+
+    // Haalt de huidige Supabase-sessie op vanuit de native AsyncStorage.
+    // De webapp roept dit aan bij elke visibility/focus-change om er zeker
+    // van te zijn dat de WebView Supabase-client hetzelfde (verse) token
+    // gebruikt als de native shell — die het token beheert en ververst
+    // tijdens Doze/achtergrond. Geeft een Promise terug; null als er geen
+    // sessie is. De native kant antwoordt via een cmds-stored-session-{reqId}
+    // CustomEvent dat door RN wordt geïnjecteerd.
+    getStoredSession: function() {
+      return new Promise(function(resolve) {
+        var reqId = Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+        var eventName = 'cmds-stored-session-' + reqId;
+        var timer = setTimeout(function() {
+          window.removeEventListener(eventName, handler);
+          resolve(null);
+        }, 2000);
+        function handler(e) {
+          clearTimeout(timer);
+          window.removeEventListener(eventName, handler);
+          resolve((e.detail != null) ? e.detail : null);
+        }
+        window.addEventListener(eventName, handler);
+        send({ type: 'get_stored_session', reqId: reqId });
+      });
     },
   };
 
@@ -911,6 +937,11 @@ export default function Index() {
             `  try{await c.auth.setSession({access_token:${safeAt},refresh_token:${safeRt}});}catch(e){}` +
             `}` +
             `}catch(e){}` +
+            // 3. cmds-native-session CustomEvent — webapp luistert hierop bij
+            //    elke visibility/focus-change als push-mechanisme naast de pull
+            //    via getStoredSession(). Beide dekken hetzelfde gebruik-geval:
+            //    WebView Supabase-client synchroon houden met de native token.
+            `window.dispatchEvent(new CustomEvent('cmds-native-session',{detail:{accessToken:${safeAt},refreshToken:${safeRt},expiresAt:${safeExp}}}));` +
             `window.dispatchEvent(new CustomEvent('onSupabaseTokenRefreshed',{detail:${JSON.stringify(payload)}}));` +
             `})();`,
         );
@@ -1106,14 +1137,27 @@ export default function Index() {
         CmdsLocation.stopService().catch(() => undefined);
       } else if (message.type === "auth_cleared") {
         void logIngest("bridge_event", { bridgeEvent: "onAuthCleared" });
+        // Wis zowel tokens ALS unit-IDs. Zonder dit blijft cmds_active_unit_id
+        // in AsyncStorage staan waardoor de autostart-recovery bij een app-resume
+        // de Kotlin service en Expo background task opnieuw zou starten — ook voor
+        // een bewust uitgelogde gebruiker.
         AsyncStorage.multiRemove([
           "cmds.supabase.access_token",
           "cmds.supabaseRefreshToken",
           "cmds.supabaseTokenExpiresAt",
           "cmds_supabase_user_id",
+          "cmds_active_unit_id",
+          "cmds_active_unit_call_sign",
+          "cmds_active_unit_event_id",
+          "cmds_active_organization_id",
         ]).catch(() => undefined);
         updateAccessToken(null);
-        console.log("[CMDS-BRIDGE] auth_cleared → tokens gewist");
+        setBridgeUnitId(null);
+        setBridgeCallSign(null);
+        setUnitOrgId(null);
+        stopBackgroundLocation().catch(() => undefined);
+        CmdsLocation.stopService().catch(() => undefined);
+        console.log("[CMDS-BRIDGE] auth_cleared → GPS gestopt + tokens + unit gewist");
       } else if (message.type === "start_gps") {
         startBackgroundLocation().catch(() => undefined);
       } else if (message.type === "stop_gps") {
@@ -1232,6 +1276,39 @@ export default function Index() {
           const current = await getDiagnostics();
           setDiagnostics({ ...current, ...patch });
         })().catch(() => undefined);
+      } else if (message.type === "get_stored_session") {
+        // WebView vraagt om de huidige native sessie (pull-mechanisme).
+        // Wordt aangeroepen via window.CMDS_NATIVE.getStoredSession() bij elke
+        // visibility/focus-change om de WebView Supabase-client synchroon te
+        // houden met de native shell die het token beheert en ververst.
+        const reqId =
+          typeof message.reqId === "string" && message.reqId.length > 0
+            ? message.reqId
+            : null;
+        if (reqId) {
+          void (async () => {
+            const [[, accessToken], [, refreshToken], [, expiresAtRaw]] =
+              await AsyncStorage.multiGet([
+                "cmds.supabase.access_token",
+                "cmds.supabaseRefreshToken",
+                "cmds.supabaseTokenExpiresAt",
+              ]);
+            const result = accessToken
+              ? {
+                  accessToken,
+                  refreshToken: refreshToken ?? "",
+                  expiresAt: expiresAtRaw ? Number(expiresAtRaw) : null,
+                }
+              : null;
+            const safeResult = JSON.stringify(result);
+            const safeEventName = JSON.stringify(
+              "cmds-stored-session-" + reqId,
+            );
+            webViewRef.current?.injectJavaScript(
+              `window.dispatchEvent(new CustomEvent(${safeEventName},{detail:${safeResult}}));true;`,
+            );
+          })();
+        }
       }
     } catch {
       // Ignore malformed messages.
@@ -1599,6 +1676,9 @@ export default function Index() {
               <Text style={styles.modalCloseText}>Sluiten</Text>
             </TouchableOpacity>
           </View>
+
+          {/* Build fingerprint — bewijst welke code er in de APK zit */}
+          <Text style={styles.ingestBuildTag}>build: {BUILD_FINGERPRINT}</Text>
 
           {/* Status summary */}
           <View style={styles.ingestStatusBar}>
@@ -2413,6 +2493,16 @@ const styles = StyleSheet.create({
     paddingBottom: 6,
     borderBottomWidth: 1,
     borderBottomColor: "#1e3a6e",
+  },
+  ingestBuildTag: {
+    color: "#334155",
+    fontSize: 10,
+    fontFamily: "monospace",
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    backgroundColor: "#0f172a",
+    borderBottomWidth: 1,
+    borderBottomColor: "#1e293b",
   },
   ingestStatusBar: {
     backgroundColor: "#0f172a",
